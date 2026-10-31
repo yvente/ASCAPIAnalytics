@@ -78,7 +78,12 @@ public struct ASCDownloadRecord:
 /// Result of parsing an App Downloads report segment.
 public struct ASCDownloadsParseResult: Sendable {
     public let records: [ASCDownloadRecord]
+    /// SHA-256 over the canonicalized header row (in file order) — audit
+    /// evidence of the parsed layout.
     public let schemaFingerprint: String
+    /// SHA-256 over the parsed column set (order-insensitive) — the
+    /// logical variant identity.
+    public let canonicalSchemaIdentity: String
     public let contentChecksum: String
     public let headerFields: [String]
 }
@@ -163,6 +168,7 @@ public struct ASCDownloadsReportParser: Sendable {
         return ASCDownloadsParseResult(
             records: records,
             schemaFingerprint: ASCFingerprint.schemaFingerprint(header: table.header),
+            canonicalSchemaIdentity: ASCFingerprint.canonicalSchemaIdentity(header: table.header),
             contentChecksum: contentChecksum,
             headerFields: table.header
         )

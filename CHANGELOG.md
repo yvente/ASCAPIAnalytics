@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (architecture review round 2)
+
+- **Sales version order independence**: importing v1 after v2 never
+  demotes v2 — a provably older version is stored as `superseded` on
+  arrival (`importedForAuditOnly` outcome, retained for audit) or skipped
+  when the content is identical, and an older version never supersedes a
+  newer one. A newer version supersedes **all** older current versions;
+  incomparable explicit versions are quarantined as `pendingReview`
+  instead of coexisting as two current versions with different content.
+- **Sales report frequency isolation**: daily, weekly, and monthly
+  reports are stored and queryable independently
+  (`salesReportKinds` on store queries, `ASCReportProvenance.salesReportKind`);
+  the provenance-aware `ASCSalesAggregator.summary` throws
+  `ambiguousMetricScope` when its input mixes report kinds instead of
+  producing double-counted totals.
+- **Analytics correction grouping**: the overwrite rule now keys on a
+  **stable logical report identity** (API report id → report name →
+  order-insensitive canonical column-set identity), so Apple reordering
+  columns or adding a compatible column no longer blocks corrections,
+  while standard and detailed variants never merge. The original
+  order-sensitive schema fingerprint is retained untouched as audit
+  evidence (`ASCReportProvenance.canonicalSchemaIdentity` added).
+- **Analytics scope safety**: provenance-aware
+  `ASCAnalyticsAggregator.downloads/discovery` apply the overwrite rule
+  and throw `ambiguousMetricScope` when asked to sum daily + weekly or
+  standard + detailed data;
+  `effectiveDownloadRecords/effectiveDiscoveryRecords` gained
+  `granularities`/`reportIdentities` selection parameters.
+- Documentation: SYNC_SEMANTICS duplicate-segment wording corrected
+  (segment-identity dedup), current-data query usage added, no claims of
+  exact Apple dashboard alignment.
+
 ### Fixed (architecture review round 1)
 
 - **Analytics instance overwrite rule**: `ASCInstanceSelection` now groups

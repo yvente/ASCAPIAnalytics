@@ -284,32 +284,118 @@ final class ASCAnalyticsAggregationTests: XCTestCase {
     }
 
     func testSelectionNeverOverwritesAcrossStandardAndDetailedVariants() {
-        // Standard and detailed report variants describe the same events
-        // with different schemas; a detailed correction must not overwrite
-        // the standard data (callers pick one variant to aggregate).
+        // Standard and detailed variants are different API reports with
+        // different ids and names: a detailed correction must not
+        // overwrite the standard data (callers pick one variant to
+        // aggregate).
         let standardEarly = selectionEntry(
             date: "2025-10-01", processingDate: "2024-04-01", counts: 10,
-            fingerprint: "standard-header"
+            reportID: "rep-standard", fingerprint: "standard-header"
         )
         let standardLate = selectionEntry(
             date: "2025-10-01", processingDate: "2024-04-03", counts: 11,
-            fingerprint: "standard-header"
+            reportID: "rep-standard", fingerprint: "standard-header-reordered"
         )
         let detailedEarly = selectionEntry(
             date: "2025-10-01", processingDate: "2024-04-01", counts: 10,
-            reportID: "rep-1", fingerprint: "detailed-header"
+            reportID: "rep-detailed", fingerprint: "detailed-header"
         )
         let detailedLate = selectionEntry(
             date: "2025-10-01", processingDate: "2024-04-02", counts: 12,
-            reportID: "rep-1", fingerprint: "detailed-header"
+            reportID: "rep-detailed", fingerprint: "detailed-header-reordered"
         )
 
         let selected = ASCInstanceSelection.latestProcessingDatePerEventDate(
             [standardEarly, standardLate, detailedEarly, detailedLate]
         )
         XCTAssertEqual(selected.count, 2, "each variant keeps its own latest instance")
-        XCTAssertTrue(selected.contains { $0.provenance.schemaFingerprint == "standard-header" && $0.record.counts == 11 })
-        XCTAssertTrue(selected.contains { $0.provenance.schemaFingerprint == "detailed-header" && $0.record.counts == 12 })
+        XCTAssertTrue(selected.contains { $0.provenance.reportID == "rep-standard" && $0.record.counts == 11 })
+        XCTAssertTrue(selected.contains { $0.provenance.reportID == "rep-detailed" && $0.record.counts == 12 })
+    }
+
+    func testSelectionSurvivesColumnReorderWithinSameReport() {
+        // Apple: "Report column position might change over time." A
+        // reordered header changes the order-sensitive fingerprint but is
+        // the same logical report: the overwrite rule must still apply.
+        let early = selectionEntry(
+            date: "2025-10-01", processingDate: "2024-04-01", counts: 10,
+            reportID: "rep-1", fingerprint: "header-order-A",
+            granularity: .daily
+        )
+        let late = selectionEntry(
+            date: "2025-10-01", processingDate: "2024-04-02", counts: 14,
+            reportID: "rep-1", fingerprint: "header-order-B",
+            granularity: .daily
+        )
+        let selected = ASCInstanceSelection.latestProcessingDatePerEventDate([early, late])
+        XCTAssertEqual(selected.count, 1)
+        XCTAssertEqual(selected[0].record.counts, 14, "later instance wins despite the reordered header")
+    }
+
+    func testSelectionSurvivesCompatibleNewColumnWithinSameReport() {
+        // Apple adding a compatible column to the same logical report is
+        // still the same report: the overwrite rule applies.
+        let early = selectionEntry(
+            date: "2025-10-01", processingDate: "2024-04-01", counts: 10,
+            reportID: "rep-1", fingerprint: "header-v1"
+        )
+        let late = selectionEntry(
+            date: "2025-10-01", processingDate: "2024-04-02", counts: 15,
+            reportID: "rep-1", fingerprint: "header-v2-with-new-column"
+        )
+        let selected = ASCInstanceSelection.latestProcessingDatePerEventDate([early, late])
+        XCTAssertEqual(selected.count, 1)
+        XCTAssertEqual(selected[0].record.counts, 15)
+    }
+
+    func testHandParsedRecordsWithoutAPIIdentityUseCanonicalColumnSet() {
+        // Records with no API report identity fall back to the
+        // order-insensitive canonical column-set identity: reordered
+        // columns stay the same variant (overwrite applies), genuinely
+        // different column sets (standard vs. detailed) stay separate.
+        func handParsed(
+            processingDate: String?, counts: Int, fingerprint: String,
+            canonical: String?
+        ) -> ASCProvenancedRecord<ASCDownloadRecord> {
+            let record = ASCDownloadRecord(
+                date: ASCCalendarDate(iso8601Day: "2025-10-01")!,
+                appAppleIdentifier: "1001",
+                rawDownloadType: "First-time Download",
+                downloadType: .firstTimeDownload,
+                territory: "US",
+                counts: counts,
+                isPreOrder: nil,
+                extraFields: [:]
+            )
+            let provenance = ASCReportProvenance(
+                sourceKind: .analyticsDownloads,
+                instanceID: "inst-\(counts)",
+                processingDate: processingDate,
+                granularity: .daily,
+                schemaFingerprint: fingerprint,
+                canonicalSchemaIdentity: canonical,
+                contentChecksum: "cc-\(counts)",
+                fetchedAt: Date(),
+                recordCount: 1
+            )
+            return ASCProvenancedRecord(record: record, provenance: provenance)
+        }
+
+        // Reordered columns: same canonical identity, later processing
+        // date wins.
+        let early = handParsed(processingDate: "2024-04-01", counts: 10, fingerprint: "order-A", canonical: "columns-abc")
+        let late = handParsed(processingDate: "2024-04-02", counts: 11, fingerprint: "order-B", canonical: "columns-abc")
+        XCTAssertEqual(
+            ASCInstanceSelection.latestProcessingDatePerEventDate([early, late]).count,
+            1
+        )
+
+        // Different column sets (standard vs detailed hand exports):
+        // separate variants, no overwrite.
+        let standard = handParsed(processingDate: "2024-04-03", counts: 20, fingerprint: "standard", canonical: "columns-standard")
+        let detailed = handParsed(processingDate: "2024-04-04", counts: 21, fingerprint: "detailed", canonical: "columns-detailed")
+        let selected = ASCInstanceSelection.latestProcessingDatePerEventDate([standard, detailed])
+        XCTAssertEqual(selected.count, 2)
     }
 
     func testSelectionNeverOverwritesAcrossGranularities() {

@@ -200,8 +200,12 @@ public struct ASCSalesRecord:
 public struct ASCSalesParseResult: Sendable {
     /// Parsed records in file order.
     public let records: [ASCSalesRecord]
-    /// SHA-256 over the canonicalized header row.
+    /// SHA-256 over the canonicalized header row (in file order) — audit
+    /// evidence of the parsed layout.
     public let schemaFingerprint: String
+    /// SHA-256 over the parsed column set (order-insensitive) — the
+    /// logical variant identity.
+    public let canonicalSchemaIdentity: String
     /// SHA-256 over the raw input bytes as received (still compressed if
     /// the input was gzipped).
     public let contentChecksum: String
@@ -273,6 +277,7 @@ public struct ASCSalesReportParser: Sendable {
         return ASCSalesParseResult(
             records: records,
             schemaFingerprint: ASCFingerprint.schemaFingerprint(header: table.header),
+            canonicalSchemaIdentity: ASCFingerprint.canonicalSchemaIdentity(header: table.header),
             contentChecksum: contentChecksum,
             headerFields: table.header
         )

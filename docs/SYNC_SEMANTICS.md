@@ -70,10 +70,12 @@ committed**: an incomplete instance is never marked successful.
 
 ## Duplicate segments
 
-Segments are physical partitions of one instance. Identical segment
-*content* appearing more than once within an instance is parsed once
-(deduplicated by content checksum) so rows are never counted twice. Rows
-are stored per segment with segment-level provenance for audit.
+Segments are physical partitions of one instance, identified by their
+**segment id**. The same segment id listed twice is downloaded and parsed
+once, so rows are never counted twice. Two *different* segment ids are
+both kept even when their bytes happen to be identical — deduplicating by
+content alone would silently discard a partition. Rows are stored per
+segment with segment-level provenance for audit.
 
 ## Late data (Analytics)
 
@@ -98,14 +100,22 @@ the oldest and survive only when no dated instance covers their date.
 
 ## Corrections
 
-- **Sales and Trends, explicit versions**: a newer, numerically
-  comparable explicit version of the same report date supersedes older
-  imported explicit versions in the same transaction. Queries exclude
-  superseded data by default (`scope: .current`); `scope: .all` retains
-  everything for audit, with the superseding key recorded on each
-  superseded entry. Incomparable version strings are **not** superseded
-  automatically: both are retained and the run reports a note for manual
-  review instead of guessing.
+- **Sales and Trends, explicit versions**: the semantics are
+  **order-independent** — importing v1 after v2 never demotes v2.
+  - A newer, numerically comparable explicit version of the same report
+    date supersedes **all** older current versions in the same
+    transaction. Queries exclude superseded data by default
+    (`scope: .current`); `scope: .all` retains everything for audit, with
+    the superseding key recorded on each superseded entry.
+  - Importing an **older** version after a newer one: with different
+    content it is stored as `superseded` on arrival (retained for audit,
+    reported as `importedForAuditOnly`); with identical content it is
+    skipped — an older version never supersedes a newer one, even when
+    the bytes match.
+  - Incomparable version strings (contents differ or are identical):
+    never superseded automatically. The new delivery is retained as
+    `pendingReview` with an explicit manual-review reason instead of two
+    current versions coexisting silently.
 - **Sales and Trends, unversioned ("latest") downloads**: Apple does not
   echo the version of an unversioned download, so the fetched content is
   recognized by actual content:
@@ -152,9 +162,27 @@ has no published day threshold; its completeness is reported as `unknown`.
 `ASCAnalyticsStore.effectiveDownloadRecords` /
 `effectiveDiscoveryRecords` apply the overwrite rule above and are the
 reliable "current data" query path — callers never apply
-`ASCInstanceSelection` by hand. Callers must still avoid summing across
-report variants or granularities, which would double count the same
-underlying events.
+`ASCInstanceSelection` by hand:
+
+```swift
+// One app's currently effective daily data for one report variant:
+let daily = try await store.effectiveDownloadRecords(
+    appIdentifiers: ["1234567890"],
+    granularities: [.daily],
+    reportIdentities: ["id:rep-1"]        // ASCInstanceSelection.logicalReportIdentity
+)
+```
+
+**Never sum across scopes.** Daily and weekly instances of the same
+window, and standard and detailed variants of the same events, describe
+the same underlying activity: summing them double counts. The
+provenance-aware aggregators enforce this —
+`ASCSalesAggregator.summary(_:[salesReportKinds:])` (sales) and
+`ASCAnalyticsAggregator.downloads(_:)` / `discovery(_:)` (analytics) throw
+`ASCAnalyticsError.ambiguousMetricScope` when their input spans several
+report kinds, granularities, or logical variants, instead of producing a
+total that looks correct but is not. Select one scope first, or aggregate
+each scope separately.
 
 ## What the engine does not do
 

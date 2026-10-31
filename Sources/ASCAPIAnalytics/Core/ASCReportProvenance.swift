@@ -59,9 +59,23 @@ public struct ASCReportProvenance:
     /// Sales and Trends report version; a later version is Apple's
     /// correction of the same report date.
     public let reportVersion: String?
-    /// SHA-256 over the canonicalized header row of the parsed file.
-    /// Identifies the exact column set that was verified.
+    /// SHA-256 over the canonicalized header row of the parsed file **in
+    /// file order**. Audit evidence of the exact header layout that was
+    /// verified; column reorders change this value by design. For the
+    /// order-insensitive logical variant identity see
+    /// `canonicalSchemaIdentity`.
     public let schemaFingerprint: String
+    /// SHA-256 over the parsed column **set** (order-insensitive). Two
+    /// files of the same logical report variant share it even when Apple
+    /// reorders columns; standard and detailed variants, with different
+    /// column sets, do not. Used as the fallback logical identity when a
+    /// record carries no API report identity.
+    public let canonicalSchemaIdentity: String?
+    /// Sales report kind (`"TYPE/SUBTYPE/FREQUENCY"`) for Sales and Trends
+    /// records; `nil` for other families. Daily, weekly, and monthly
+    /// reports of the same date carry different kinds and must never be
+    /// summed implicitly.
+    public let salesReportKind: String?
     /// SHA-256 over the raw (still compressed, as-downloaded) bytes of the
     /// segment or report file.
     public let contentChecksum: String
@@ -84,7 +98,9 @@ public struct ASCReportProvenance:
         vendorNumber: String? = nil,
         reportDate: String? = nil,
         reportVersion: String? = nil,
+        salesReportKind: String? = nil,
         schemaFingerprint: String,
+        canonicalSchemaIdentity: String? = nil,
         contentChecksum: String,
         fetchedAt: Date,
         recordCount: Int
@@ -101,7 +117,9 @@ public struct ASCReportProvenance:
         self.vendorNumber = vendorNumber
         self.reportDate = reportDate
         self.reportVersion = reportVersion
+        self.salesReportKind = salesReportKind
         self.schemaFingerprint = schemaFingerprint
+        self.canonicalSchemaIdentity = canonicalSchemaIdentity
         self.contentChecksum = contentChecksum
         self.fetchedAt = fetchedAt
         self.recordCount = recordCount
@@ -126,7 +144,9 @@ public struct ASCReportProvenance:
             vendorNumber: vendorNumber,
             reportDate: reportDate,
             reportVersion: reportVersion,
+            salesReportKind: salesReportKind,
             schemaFingerprint: schemaFingerprint,
+            canonicalSchemaIdentity: canonicalSchemaIdentity,
             contentChecksum: contentChecksum,
             fetchedAt: fetchedAt,
             recordCount: recordCount
@@ -156,7 +176,9 @@ public struct ASCReportProvenance:
             vendorNumber: vendorNumber,
             reportDate: reportDate,
             reportVersion: reportVersion,
+            salesReportKind: salesReportKind,
             schemaFingerprint: schemaFingerprint,
+            canonicalSchemaIdentity: canonicalSchemaIdentity,
             contentChecksum: contentChecksum,
             fetchedAt: fetchedAt,
             recordCount: recordCount
@@ -167,7 +189,8 @@ public struct ASCReportProvenance:
     public func withSalesContext(
         vendorNumber: String?,
         reportDate: String?,
-        reportVersion: String?
+        reportVersion: String?,
+        salesReportKind: String? = nil
     ) -> ASCReportProvenance {
         ASCReportProvenance(
             sourceKind: sourceKind,
@@ -182,7 +205,9 @@ public struct ASCReportProvenance:
             vendorNumber: vendorNumber ?? self.vendorNumber,
             reportDate: reportDate ?? self.reportDate,
             reportVersion: reportVersion ?? self.reportVersion,
+            salesReportKind: salesReportKind ?? self.salesReportKind,
             schemaFingerprint: schemaFingerprint,
+            canonicalSchemaIdentity: canonicalSchemaIdentity,
             contentChecksum: contentChecksum,
             fetchedAt: fetchedAt,
             recordCount: recordCount
@@ -197,13 +222,28 @@ public enum ASCFingerprint {
         SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 
-    /// SHA-256 hex digest of the canonicalized header row: fields joined
-    /// with tabs, case preserved, surrounding whitespace of each field
-    /// trimmed. Column *positions* may change over time per Apple's
-    /// guidance; the fingerprint pins the column *set* that was verified.
+    /// SHA-256 hex digest of the canonicalized header row **in file
+    /// order**: fields joined with tabs, surrounding whitespace of each
+    /// field trimmed. This is the audit fingerprint of the exact header
+    /// layout that was parsed. For an order-insensitive logical variant
+    /// identity, use `canonicalSchemaIdentity(header:)`.
     public static func schemaFingerprint(header: [String]) -> String {
         let canonical = header
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .joined(separator: "\t")
+        return sha256Hex(Data(canonical.utf8))
+    }
+
+    /// SHA-256 hex digest of the **column set**, independent of column
+    /// order: names trimmed and lowercased (Apple advises relying on
+    /// column names, which are not case sensitive), sorted, joined with
+    /// tabs. Two files with the same columns in a different order share
+    /// this identity; two different report variants (standard vs.
+    /// detailed, with different column sets) do not.
+    public static func canonicalSchemaIdentity(header: [String]) -> String {
+        let canonical = header
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+            .sorted()
             .joined(separator: "\t")
         return sha256Hex(Data(canonical.utf8))
     }

@@ -89,7 +89,12 @@ public struct ASCDiscoveryRecord:
 /// Result of parsing an App Store Discovery and Engagement report segment.
 public struct ASCDiscoveryParseResult: Sendable {
     public let records: [ASCDiscoveryRecord]
+    /// SHA-256 over the canonicalized header row (in file order) — audit
+    /// evidence of the parsed layout.
     public let schemaFingerprint: String
+    /// SHA-256 over the parsed column set (order-insensitive) — the
+    /// logical variant identity.
+    public let canonicalSchemaIdentity: String
     public let contentChecksum: String
     public let headerFields: [String]
 }
@@ -165,6 +170,7 @@ public struct ASCDiscoveryReportParser: Sendable {
         return ASCDiscoveryParseResult(
             records: records,
             schemaFingerprint: ASCFingerprint.schemaFingerprint(header: table.header),
+            canonicalSchemaIdentity: ASCFingerprint.canonicalSchemaIdentity(header: table.header),
             contentChecksum: contentChecksum,
             headerFields: table.header
         )

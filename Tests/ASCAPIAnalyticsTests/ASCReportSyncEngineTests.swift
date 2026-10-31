@@ -701,21 +701,23 @@ final class ASCReportSyncEngineTests: XCTestCase {
         XCTAssertEqual(pending.count, 1)
     }
 
-    func testExplicitVersionIdentifyingAlreadyImportedContentSupersedesUnversionedEntry() async throws {
+    func testExplicitVersionMatchingUnversionedContentIsSkippedWithoutSupersession() async throws {
         // The unversioned latest download returned some content; a later
-        // explicit version download returns byte-identical content: the
-        // version identifies what we already have. The unversioned entry
-        // is superseded, and exactly one counted copy remains.
+        // explicit version download returns byte-identical content. The
+        // order between an explicit version and an unversioned import is
+        // unknowable, so the explicit version never supersedes it — the
+        // content is already counted exactly once and nothing changes.
         let payload = salesPayload(units: "5", price: "0.99")
         _ = try await syncSalesVersion(reportDate: "2025-10-01", version: nil, payload: payload)
         let identified = try await syncSalesVersion(reportDate: "2025-10-01", version: "1", payload: payload)
 
-        XCTAssertTrue(identified.outcome.isSuccessfulImport)
-        XCTAssertEqual(identified.supersededVersions, ["latest(unversioned)"])
+        XCTAssertEqual(identified.outcome, .skippedAlreadyImported)
+        XCTAssertTrue(identified.supersededVersions.isEmpty)
+        XCTAssertFalse(identified.notes.isEmpty, "the skip carries an explanatory note")
         let current = try await store.salesRecords()
         XCTAssertEqual(current.count, 1, "same content: no double counting")
         let audit = try await store.salesRecords(scope: .all)
-        XCTAssertEqual(audit.count, 2)
+        XCTAssertEqual(audit.count, 1, "no new entry was created for identical content")
     }
 
     func testDifferentFrequencySameDateAreDistinctIdentities() async throws {
@@ -766,6 +768,362 @@ final class ASCReportSyncEngineTests: XCTestCase {
         guard case .imported = weekly.outcome else {
             return XCTFail("weekly with identical content must be its own import, got \(weekly.outcome)")
         }
+    }
+
+    // MARK: - Sales version order independence
+
+    func testImportingOlderVersionAfterNewerDoesNotBecomeCurrent() async throws {
+        // v2 is imported first; importing v1 afterwards must never demote
+        // v2: v1 is retained for audit only.
+        _ = try await syncSalesVersion(reportDate: "2025-10-01", version: "2", payload: salesPayload(units: "20", price: "0.99"))
+        let older = try await syncSalesVersion(reportDate: "2025-10-01", version: "1", payload: salesPayload(units: "8", price: "0.99"))
+
+        guard case .importedForAuditOnly(let count, let supersededBy) = older.outcome else {
+            return XCTFail("expected importedForAuditOnly, got \(older.outcome)")
+        }
+        XCTAssertEqual(count, 1)
+        XCTAssertEqual(supersededBy, "2")
+
+        // v2 remains the only current data.
+        let current = try await store.salesRecords()
+        XCTAssertEqual(current.count, 1)
+        XCTAssertEqual(current[0].record.units, 20)
+        XCTAssertEqual(current[0].provenance.reportVersion, "2")
+        // v1 is retained for audit.
+        let audit = try await store.salesRecords(scope: .all)
+        XCTAssertEqual(audit.count, 2)
+        let superseded = try await store.beginTransaction().ingestionEntries(state: .superseded)
+        XCTAssertEqual(superseded.count, 1)
+        XCTAssertEqual(superseded[0].key.reportVersion, "1")
+    }
+
+    func testImportingNewerVersionAfterOlderSupersedesIt() async throws {
+        // The forward order: v2 supersedes v1.
+        _ = try await syncSalesVersion(reportDate: "2025-10-01", version: "1", payload: salesPayload(units: "8", price: "0.99"))
+        let newer = try await syncSalesVersion(reportDate: "2025-10-01", version: "2", payload: salesPayload(units: "20", price: "0.99"))
+
+        XCTAssertTrue(newer.outcome.isSuccessfulImport)
+        XCTAssertEqual(newer.supersededVersions, ["1"])
+        let current = try await store.salesRecords()
+        XCTAssertEqual(current.count, 1)
+        XCTAssertEqual(current[0].record.units, 20)
+    }
+
+    func testSameContentReverseOrderNeverSupersedesNewerVersion() async throws {
+        // v2 current; v1 arrives with byte-identical content: v1 must not
+        // supersede v2 even though the content matches, and nothing new is
+        // counted.
+        let payload = salesPayload(units: "12", price: "0.99")
+        _ = try await syncSalesVersion(reportDate: "2025-10-01", version: "2", payload: payload)
+        let older = try await syncSalesVersion(reportDate: "2025-10-01", version: "1", payload: payload)
+
+        XCTAssertEqual(older.outcome, .skippedAlreadyImported)
+        XCTAssertTrue(older.supersededVersions.isEmpty)
+        XCTAssertFalse(older.notes.isEmpty)
+        let current = try await store.salesRecords()
+        XCTAssertEqual(current.count, 1)
+        XCTAssertEqual(current[0].provenance.reportVersion, "2")
+        let audit = try await store.salesRecords(scope: .all)
+        XCTAssertEqual(audit.count, 1, "identical content creates no second entry")
+    }
+
+    func testMultiVersionMixedImportOrderKeepsExactlyOneCurrent() async throws {
+        // v1 → v3 → v2: v2 is older than the current v3 and must land as
+        // audit-only; exactly one current version remains.
+        _ = try await syncSalesVersion(reportDate: "2025-10-01", version: "1", payload: salesPayload(units: "1", price: "0.99"))
+        _ = try await syncSalesVersion(reportDate: "2025-10-01", version: "3", payload: salesPayload(units: "3", price: "0.99"))
+        let middle = try await syncSalesVersion(reportDate: "2025-10-01", version: "2", payload: salesPayload(units: "2", price: "0.99"))
+
+        guard case .importedForAuditOnly(_, let supersededBy) = middle.outcome else {
+            return XCTFail("expected importedForAuditOnly, got \(middle.outcome)")
+        }
+        XCTAssertEqual(supersededBy, "3")
+
+        let current = try await store.salesRecords()
+        XCTAssertEqual(current.count, 1)
+        XCTAssertEqual(current[0].record.units, 3)
+        let audit = try await store.salesRecords(scope: .all)
+        XCTAssertEqual(audit.count, 3, "all three versions retained")
+    }
+
+    func testNewerVersionSupersedesAllOlderCurrentVersions() async throws {
+        // A multi-version history where the newest supersedes every older
+        // current version at once.
+        _ = try await syncSalesVersion(reportDate: "2025-10-01", version: "1", payload: salesPayload(units: "1", price: "0.99"))
+        _ = try await syncSalesVersion(reportDate: "2025-10-01", version: "2", payload: salesPayload(units: "2", price: "0.99"))
+        let newest = try await syncSalesVersion(reportDate: "2025-10-01", version: "3", payload: salesPayload(units: "3", price: "0.99"))
+
+        XCTAssertTrue(newest.outcome.isSuccessfulImport)
+        // v1 was already superseded when v2 arrived; v3 supersedes the
+        // only remaining current version.
+        XCTAssertEqual(newest.supersededVersions, ["2"], "all older current versions superseded")
+        let current = try await store.salesRecords()
+        XCTAssertEqual(current.count, 1)
+        XCTAssertEqual(current[0].record.units, 3)
+        let superseded = try await store.beginTransaction().ingestionEntries(state: .superseded)
+        XCTAssertEqual(superseded.count, 2, "v1 and v2 both retained as superseded")
+    }
+
+    func testIncomparableExplicitVersionsAreQuarantinedForManualReview() async throws {
+        // Two explicit versions whose strings cannot be ordered and whose
+        // contents differ: the new delivery is retained as pending review
+        // instead of coexisting as a second current version.
+        _ = try await syncSalesVersion(reportDate: "2025-10-01", version: "1A", payload: salesPayload(units: "5", price: "0.99"))
+        let other = try await syncSalesVersion(reportDate: "2025-10-01", version: "2B", payload: salesPayload(units: "9", price: "0.99"))
+
+        guard case .pendingReview(let reason) = other.outcome else {
+            return XCTFail("expected pendingReview, got \(other.outcome)")
+        }
+        XCTAssertTrue(reason.contains("manual review"), reason)
+        let current = try await store.salesRecords()
+        XCTAssertEqual(current.count, 1, "only the first import stays current")
+        let audit = try await store.salesRecords(scope: .all)
+        XCTAssertEqual(audit.count, 2, "the incomparable delivery is retained")
+    }
+
+    // MARK: - Sales report kind isolation
+
+    /// Different content per frequency so daily and weekly imports are
+    /// distinguishable.
+    nonisolated func salesPayloadForKind(units: String) -> Data {
+        ASCFixtures.salesReport([
+            ASCFixtures.salesLine(
+                sku: "APPONE", productType: "1F", units: units,
+                proceeds: "0.70", customerPrice: "0.99"
+            )
+        ])
+    }
+
+    private func syncSalesKind(
+        frequency: ASCSalesReportFrequency, units: String
+    ) async throws {
+        provider.downloadSalesReportHandler = { _ in
+            self.salesPayloadForKind(units: units)
+        }
+        _ = try await engine.syncSales(
+            ASCSalesSyncConfiguration(
+                vendorNumber: "80000",
+                frequency: frequency,
+                reportDates: ["2025-10-01", "2025-10-02"]
+            ),
+            store: store
+        )
+    }
+
+    func testDailyAndWeeklyCoexistAndAreSelectableByKind() async throws {
+        // Daily and weekly reports for the same dates: stored
+        // independently, retrievable per kind, and never implicitly mixed.
+        try await syncSalesKind(frequency: .daily, units: "2")
+        try await syncSalesKind(frequency: .weekly, units: "14")
+
+        let all = try await store.salesRecords()
+        XCTAssertEqual(all.count, 4, "2 dates × 2 kinds")
+        let kinds = Set(all.compactMap(\.provenance.salesReportKind))
+        XCTAssertEqual(kinds, ["SALES/SUMMARY/DAILY", "SALES/SUMMARY/WEEKLY"])
+
+        let dailyOnly = try await store.salesRecords(
+            salesReportKinds: ["SALES/SUMMARY/DAILY"]
+        )
+        XCTAssertEqual(dailyOnly.count, 2)
+        XCTAssertEqual(Set(dailyOnly.map(\.record.units)), [2])
+
+        let weeklyOnly = try await store.salesRecords(
+            salesReportKinds: ["SALES/SUMMARY/WEEKLY"]
+        )
+        XCTAssertEqual(weeklyOnly.count, 2)
+        XCTAssertEqual(Set(weeklyOnly.map(\.record.units)), [14])
+    }
+
+    func testMixedKindAggregationThrowsStructuredAmbiguity() async throws {
+        try await syncSalesKind(frequency: .daily, units: "2")
+        try await syncSalesKind(frequency: .weekly, units: "14")
+
+        let records = try await store.salesRecords()
+        let aggregator = ASCSalesAggregator()
+
+        // Without an explicit kind selection the mixed scope is refused
+        // instead of producing a total that double counts overlapping
+        // periods.
+        XCTAssertThrowsError(try aggregator.summary(records)) { error in
+            guard case ASCAnalyticsError.ambiguousMetricScope(let reason) = error else {
+                return XCTFail("expected ambiguousMetricScope, got \(error)")
+            }
+            XCTAssertTrue(reason.contains("report kinds"), reason)
+            XCTAssertTrue(reason.contains("SALES/SUMMARY/DAILY"), reason)
+        }
+
+        // With an explicit kind selection the aggregation is exact.
+        let daily = try aggregator.summary(
+            records, salesReportKinds: ["SALES/SUMMARY/DAILY"]
+        )
+        XCTAssertEqual(daily.totals.grossSales(currency: "USD"), Decimal(string: "3.96"))
+        let weekly = try aggregator.summary(
+            records, salesReportKinds: ["SALES/SUMMARY/WEEKLY"]
+        )
+        XCTAssertEqual(weekly.totals.grossSales(currency: "USD"), Decimal(string: "27.72"))
+    }
+
+    // MARK: - Analytics aggregation scope safety
+
+    func testMixedGranularityAggregationThrowsStructuredAmbiguity() async throws {
+        // Daily and weekly instances of the same report for the same
+        // event scope: summing them would double count.
+        let records: [ASCProvenancedRecord<ASCDownloadRecord>] = [
+            selectionEntryForScope(
+                date: "2025-09-30", processingDate: "2024-04-01", counts: 5,
+                reportID: "rep-1", granularity: .daily
+            ),
+            selectionEntryForScope(
+                date: "2025-09-30", processingDate: "2024-04-05", counts: 42,
+                reportID: "rep-1", granularity: .weekly
+            ),
+        ]
+        let aggregator = ASCAnalyticsAggregator()
+        XCTAssertThrowsError(try aggregator.downloads(records)) { error in
+            guard case ASCAnalyticsError.ambiguousMetricScope(let reason) = error else {
+                return XCTFail("expected ambiguousMetricScope, got \(error)")
+            }
+            XCTAssertTrue(reason.contains("daily"), reason)
+            XCTAssertTrue(reason.contains("weekly"), reason)
+        }
+    }
+
+    func testMixedVariantAggregationThrowsStructuredAmbiguity() async throws {
+        // Standard and detailed instances of the same app and window:
+        // summing them would double count.
+        let records: [ASCProvenancedRecord<ASCDownloadRecord>] = [
+            selectionEntryForScope(
+                date: "2025-10-01", processingDate: "2024-04-01", counts: 5,
+                reportID: "rep-standard", granularity: .daily
+            ),
+            selectionEntryForScope(
+                date: "2025-10-01", processingDate: "2024-04-02", counts: 7,
+                reportID: "rep-detailed", granularity: .daily
+            ),
+        ]
+        let aggregator = ASCAnalyticsAggregator()
+        XCTAssertThrowsError(try aggregator.downloads(records)) { error in
+            guard case ASCAnalyticsError.ambiguousMetricScope = error else {
+                return XCTFail("expected ambiguousMetricScope, got \(error)")
+            }
+        }
+    }
+
+    func testSingleScopeProvenanceAggregationIsExact() async throws {
+        // Corrections of one report at one granularity aggregate exactly
+        // after the overwrite rule.
+        let records: [ASCProvenancedRecord<ASCDownloadRecord>] = [
+            selectionEntryForScope(
+                date: "2025-10-01", processingDate: "2024-04-01", counts: 10,
+                reportID: "rep-1", granularity: .daily
+            ),
+            selectionEntryForScope(
+                date: "2025-10-01", processingDate: "2024-04-02", counts: 12,
+                reportID: "rep-1", granularity: .daily
+            ),
+            selectionEntryForScope(
+                date: "2025-10-02", processingDate: "2024-04-02", counts: 3,
+                reportID: "rep-1", granularity: .daily
+            ),
+        ]
+        let summary = try ASCAnalyticsAggregator().downloads(records)
+        XCTAssertEqual(summary.totals.firstTimeDownloads, 15, "12 (corrected) + 3")
+        XCTAssertEqual(summary.byDay.count, 2)
+    }
+
+    func testEffectiveQueriesProvideGranularityAndVariantSelection() async throws {
+        let store = ASCInMemoryAnalyticsStore()
+        func ingest(
+            reportID: String, granularity: ASCReportGranularity, counts: Int,
+            processingDate: String
+        ) async throws {
+            let record = ASCDownloadRecord(
+                date: ASCCalendarDate(iso8601Day: "2025-10-01")!,
+                appAppleIdentifier: "1001",
+                rawDownloadType: "First-time Download",
+                downloadType: .firstTimeDownload,
+                territory: "US",
+                counts: counts,
+                isPreOrder: nil,
+                extraFields: [:]
+            )
+            let provenance = ASCReportProvenance(
+                sourceKind: .analyticsDownloads,
+                reportName: "app-download",
+                reportID: reportID,
+                instanceID: "inst-\(reportID)-\(granularity.rawValue)",
+                processingDate: processingDate,
+                granularity: granularity,
+                schemaFingerprint: "fp-\(reportID)",
+                contentChecksum: "cc-\(counts)",
+                fetchedAt: Date(),
+                recordCount: 1
+            )
+            let key = ASCIngestionKey(
+                sourceKind: .analyticsDownloads,
+                instanceID: provenance.instanceID
+            )
+            try await store.withTransaction { transaction in
+                try await transaction.insertDownloads(
+                    [ASCProvenancedRecord(record: record, provenance: provenance)],
+                    ingestionKey: key
+                )
+                try await transaction.upsertIngestion(ASCIngestionEntry(
+                    key: key, state: .imported,
+                    processingDate: processingDate,
+                    granularity: granularity,
+                    schemaFingerprint: provenance.schemaFingerprint,
+                    contentChecksum: provenance.contentChecksum,
+                    recordCount: 1,
+                    importedAt: Date()
+                ))
+            }
+        }
+
+        try await ingest(reportID: "rep-standard", granularity: .daily, counts: 10, processingDate: "2024-04-02")
+        try await ingest(reportID: "rep-detailed", granularity: .daily, counts: 12, processingDate: "2024-04-02")
+        try await ingest(reportID: "rep-standard", granularity: .weekly, counts: 70, processingDate: "2024-04-05")
+
+        // Selection interface: pick one granularity, one variant.
+        let standardDaily = try await store.effectiveDownloadRecords(
+            granularities: [.daily],
+            reportIdentities: ["id:rep-standard"]
+        )
+        XCTAssertEqual(standardDaily.count, 1)
+        XCTAssertEqual(standardDaily[0].record.counts, 10)
+
+        // The unselected union keeps all three scopes separate.
+        let everything = try await store.effectiveDownloadRecords()
+        XCTAssertEqual(everything.count, 3)
+    }
+
+    private func selectionEntryForScope(
+        date: String, processingDate: String, counts: Int,
+        reportID: String, granularity: ASCReportGranularity
+    ) -> ASCProvenancedRecord<ASCDownloadRecord> {
+        let record = ASCDownloadRecord(
+            date: ASCCalendarDate(iso8601Day: date)!,
+            appAppleIdentifier: "1001",
+            rawDownloadType: "First-time Download",
+            downloadType: .firstTimeDownload,
+            territory: "US",
+            counts: counts,
+            isPreOrder: nil,
+            extraFields: [:]
+        )
+        let provenance = ASCReportProvenance(
+            sourceKind: .analyticsDownloads,
+            reportName: "app-download",
+            reportID: reportID,
+            instanceID: "inst-\(reportID)-\(granularity.rawValue)-\(counts)",
+            processingDate: processingDate,
+            granularity: granularity,
+            schemaFingerprint: "fp-\(reportID)",
+            contentChecksum: "cc-\(counts)",
+            fetchedAt: Date(),
+            recordCount: 1
+        )
+        return ASCProvenancedRecord(record: record, provenance: provenance)
     }
 
     // MARK: - Offline guarantees

@@ -206,9 +206,27 @@ let records = try await store.downloadRecords(
 )
 // every record carries full ASCReportProvenance for audit
 
-// Apple's overwrite rule across processing dates:
-let latest = ASCInstanceSelection.latestProcessingDatePerEventDate(records)
-let metrics = ASCDownloadMetrics(records: latest.map(\.record))
+// Currently effective data (Apple's overwrite rule applied within each
+// app/report/variant/granularity/date group), narrowed to one scope:
+let effective = try await store.effectiveDownloadRecords(
+    appIdentifiers: ["1234567890"],
+    granularities: [.daily],                 // pick daily OR weekly
+    reportIdentities: ["id:rep-1"]           // pick standard OR detailed
+)
+let metrics = ASCDownloadMetrics(records: effective.map(\.record))
+
+// Scope-safe aggregation: provenance-carrying inputs apply the overwrite
+// rule and REFUSE to sum across granularities or variants.
+let summary = try ASCAnalyticsAggregator().downloads(effective)
+// → ASCAnalyticsError.ambiguousMetricScope when the input mixes scopes
+
+// Sales: same isolation for report frequency (daily/weekly/monthly).
+let salesRecords = try await store.salesRecords(
+    salesReportKinds: ["SALES/SUMMARY/DAILY"]   // pick the frequency
+)
+let salesSummary = try ASCSalesAggregator().summary(
+    salesRecords, salesReportKinds: ["SALES/SUMMARY/DAILY"]
+)
 
 // Data completeness against Apple's published thresholds:
 let completeness = ASCReportCompletenessThreshold.assess(

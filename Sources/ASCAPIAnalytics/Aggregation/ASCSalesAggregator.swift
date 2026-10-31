@@ -165,4 +165,45 @@ public struct ASCSalesAggregator: Sendable {
             byApp: appSummaries
         )
     }
+
+    /// Aggregates sales records that carry provenance, with **report
+    /// frequency isolation**: daily, weekly, and monthly reports of the
+    /// same dates describe different periods and must never be summed
+    /// implicitly.
+    ///
+    /// - Parameters:
+    ///   - records: provenance-carrying sales records (for example from
+    ///     `ASCAnalyticsStore.salesRecords`).
+    ///   - salesReportKinds: when set, only records of these kinds
+    ///     (`"TYPE/SUBTYPE/FREQUENCY"`, as stored in
+    ///     `ASCReportProvenance.salesReportKind`) are aggregated.
+    ///   - filter: the usual record filter.
+    ///
+    /// When the remaining records span more than one report kind and no
+    /// kind selection was made, this throws
+    /// `ASCAnalyticsError.ambiguousMetricScope` rather than producing a
+    /// total that looks correct but double counts overlapping periods.
+    public func summary(
+        _ records: [ASCProvenancedRecord<ASCSalesRecord>],
+        salesReportKinds: Set<String>? = nil,
+        filter: ASCSalesFilter = ASCSalesFilter()
+    ) throws -> ASCSalesSummary {
+        var scoped = records
+        if let salesReportKinds {
+            scoped = scoped.filter { entry in
+                entry.provenance.salesReportKind.map { salesReportKinds.contains($0) } ?? false
+            }
+        }
+        let filtered = scoped.filter { filter.matches($0.record) }
+
+        let kinds = Set(filtered.map { $0.provenance.salesReportKind ?? "unspecified" })
+        guard kinds.count <= 1 else {
+            let described = kinds.sorted().joined(separator: ", ")
+            throw ASCAnalyticsError.ambiguousMetricScope(
+                reason: "the sales records span \(kinds.count) report kinds (\(described)); daily, weekly, and monthly reports cover different periods of the same dates and summing them would double count — select one kind via salesReportKinds or aggregate each kind separately"
+            )
+        }
+
+        return summary(filtered.map(\.record), filter: filter)
+    }
 }

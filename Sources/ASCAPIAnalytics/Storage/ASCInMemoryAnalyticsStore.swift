@@ -208,6 +208,7 @@ public final class ASCInMemoryAnalyticsStore: ASCAnalyticsStore, @unchecked Send
         func salesRecords(
             appAppleIdentifiers: Set<String>?,
             parentIdentifiers: Set<String>?,
+            salesReportKinds: Set<String>?,
             in range: ASCDateRange?,
             scope: ASCIngestionQueryScope
         ) async throws -> [ASCProvenancedRecord<ASCSalesRecord>] {
@@ -217,6 +218,7 @@ public final class ASCInMemoryAnalyticsStore: ASCAnalyticsStore, @unchecked Send
             return try await store.salesRecords(
                 appAppleIdentifiers: appAppleIdentifiers,
                 parentIdentifiers: parentIdentifiers,
+                salesReportKinds: salesReportKinds,
                 in: range,
                 scope: scope
             )
@@ -314,12 +316,14 @@ public final class ASCInMemoryAnalyticsStore: ASCAnalyticsStore, @unchecked Send
     public func salesRecords(
         appAppleIdentifiers: Set<String>? = nil,
         parentIdentifiers: Set<String>? = nil,
+        salesReportKinds: Set<String>? = nil,
         in range: ASCDateRange? = nil,
         scope: ASCIngestionQueryScope = .current
     ) async throws -> [ASCProvenancedRecord<ASCSalesRecord>] {
         querySalesLocked(
             appAppleIdentifiers: appAppleIdentifiers,
             parentIdentifiers: parentIdentifiers,
+            salesReportKinds: salesReportKinds,
             in: range,
             scope: scope
         )
@@ -356,6 +360,7 @@ public final class ASCInMemoryAnalyticsStore: ASCAnalyticsStore, @unchecked Send
     private func querySalesLocked(
         appAppleIdentifiers: Set<String>?,
         parentIdentifiers: Set<String>?,
+        salesReportKinds: Set<String>?,
         in range: ASCDateRange?,
         scope: ASCIngestionQueryScope
     ) -> [ASCProvenancedRecord<ASCSalesRecord>] {
@@ -375,6 +380,11 @@ public final class ASCInMemoryAnalyticsStore: ASCAnalyticsStore, @unchecked Send
                     appAppleIdentifiers: appAppleIdentifiers,
                     parentIdentifiers: parentIdentifiers
                 ) else { continue }
+                if let salesReportKinds {
+                    guard let kind = entry.provenance.salesReportKind,
+                          salesReportKinds.contains(kind)
+                    else { continue }
+                }
                 if let range {
                     guard range.contains(record.beginDate) || range.contains(record.endDate) else {
                         continue

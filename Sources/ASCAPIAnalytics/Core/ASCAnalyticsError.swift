@@ -130,4 +130,12 @@ public enum ASCAnalyticsError: Error, Equatable, Sendable {
 
     /// The provider returned data that cannot be processed.
     case providerInvalidData(reason: String)
+
+    /// An aggregation input spans multiple report granularities (daily +
+    /// weekly) or multiple logical report variants (standard + detailed)
+    /// for the same event scope. Summing them would double count the same
+    /// underlying events; select one granularity/variant (see
+    /// `ASCAnalyticsStore.effectiveDownloadRecords` /
+    /// `effectiveDiscoveryRecords`) and aggregate again.
+    case ambiguousMetricScope(reason: String)
 }

@@ -221,6 +221,100 @@ public struct ASCAnalyticsAggregator: Sendable {
         }
         return .unavailable(reason: basisReason)
     }
+
+    // MARK: - Provenance-aware aggregation (granularity/variant safe)
+
+    /// Aggregates download records that carry provenance, safely:
+    /// Apple's latest-processing-date overwrite rule is applied first,
+    /// then the scope is verified — an input spanning multiple logical
+    /// report variants (standard/detailed) or multiple granularities
+    /// (daily/weekly) for the same event scope throws
+    /// `ASCAnalyticsError.ambiguousMetricScope` instead of producing
+    /// totals that double count the same underlying events.
+    public func downloads(
+        _ records: [ASCProvenancedRecord<ASCDownloadRecord>],
+        filter: ASCAnalyticsFilter = ASCAnalyticsFilter()
+    ) throws -> ASCDownloadSummary {
+        // Dimension filters that do not interact with selection first.
+        var prefiltered = records
+        if let appIdentifiers = filter.appIdentifiers {
+            prefiltered = prefiltered.filter {
+                appIdentifiers.contains($0.record.appAppleIdentifier)
+            }
+        }
+        if let territories = filter.territories {
+            prefiltered = prefiltered.filter {
+                territories.contains($0.record.territory)
+            }
+        }
+        // Overwrite rule per (app, variant, granularity, date).
+        let selected = ASCInstanceSelection.latestProcessingDatePerEventDate(prefiltered)
+        // Date range last: the latest instance may cover a wider range.
+        let dateFiltered: [ASCProvenancedRecord<ASCDownloadRecord>]
+        if let range = filter.dateRange {
+            dateFiltered = selected.filter { range.contains($0.record.date) }
+        } else {
+            dateFiltered = selected
+        }
+        try Self.verifySingleMetricScope(
+            dateFiltered.map { ($0.record, $0.provenance) }
+        )
+        var effectiveFilter = filter
+        effectiveFilter.dateRange = nil
+        return downloads(dateFiltered.map(\.record), filter: effectiveFilter)
+    }
+
+    /// Same as `downloads(_:_:)` for discovery records.
+    public func discovery(
+        _ records: [ASCProvenancedRecord<ASCDiscoveryRecord>],
+        filter: ASCAnalyticsFilter = ASCAnalyticsFilter()
+    ) throws -> ASCDiscoverySummary {
+        var prefiltered = records
+        if let appIdentifiers = filter.appIdentifiers {
+            prefiltered = prefiltered.filter {
+                appIdentifiers.contains($0.record.appAppleIdentifier)
+            }
+        }
+        if let territories = filter.territories {
+            prefiltered = prefiltered.filter {
+                territories.contains($0.record.territory)
+            }
+        }
+        let selected = ASCInstanceSelection.latestProcessingDatePerEventDate(prefiltered)
+        let dateFiltered: [ASCProvenancedRecord<ASCDiscoveryRecord>]
+        if let range = filter.dateRange {
+            dateFiltered = selected.filter { range.contains($0.record.date) }
+        } else {
+            dateFiltered = selected
+        }
+        try Self.verifySingleMetricScope(
+            dateFiltered.map { ($0.record, $0.provenance) }
+        )
+        var effectiveFilter = filter
+        effectiveFilter.dateRange = nil
+        return discovery(dateFiltered.map(\.record), filter: effectiveFilter)
+    }
+
+    /// Throws `ambiguousMetricScope` when the records span more than one
+    /// (logical report variant, granularity) scope.
+    static func verifySingleMetricScope<Record: ASCAnalyticsEventRecord>(
+        _ entries: [(record: Record, provenance: ASCReportProvenance)]
+    ) throws {
+        var scopes: [String: (identity: String, granularity: String)] = [:]
+        for entry in entries {
+            let identity = ASCInstanceSelection.logicalReportIdentity(of: entry.provenance)
+            let granularity = entry.provenance.granularity?.rawValue ?? "unspecified"
+            scopes["\(identity)|\(granularity)"] = (identity, granularity)
+        }
+        guard scopes.count > 1 else { return }
+        let described = scopes.values
+            .sorted { ($0.identity, $0.granularity) < ($1.identity, $1.granularity) }
+            .map { "\($0.identity) [\($0.granularity)]" }
+            .joined(separator: ", ")
+        throw ASCAnalyticsError.ambiguousMetricScope(
+            reason: "the records span \(scopes.count) report scopes (\(described)); summing daily and weekly instances, or standard and detailed variants, would double count the same underlying events — select one scope via ASCAnalyticsStore.effectiveDownloadRecords/effectiveDiscoveryRecords(granularities:reportIdentities:) or aggregate each scope separately"
+        )
+    }
 }
 
 extension Set {
@@ -236,41 +330,61 @@ extension Set {
 /// instances with an earlier processing date … Don't merge records for a
 /// Date across two report instances to avoid double counting. Use the
 /// latest instance."
+///
+/// Overwriting is applied **within one logical report variant only**. The
+/// variant identity is stable and independent of column order: the API
+/// report id when present, else the report name, else — for inputs with
+/// no API identity at all — the order-insensitive canonical column-set
+/// hash (`canonicalSchemaIdentity`). Apple reordering columns or adding a
+/// compatible column therefore stays the same variant (the overwrite rule
+/// applies across such instances), while the standard and detailed
+/// variants — different reports with different ids/names/column sets —
+/// never merge. The original order-sensitive `schemaFingerprint` is kept
+/// untouched on every record as audit evidence.
 public enum ASCInstanceSelection {
     /// The deduplication scope of one overwrite group: an app's records
-    /// for one report (identified by report id, or name when the API id is
-    /// absent), one schema variant (standard vs. detailed — distinguished
-    /// by the verified header fingerprint), one granularity, and one event
-    /// date. Overwriting is only ever applied *within* such a group;
-    /// different apps, reports, variants, or granularities coexist.
+    /// for one logical report variant, one granularity, and one event
+    /// date.
     public struct SelectionKey: Hashable, Sendable {
         public let appIdentifier: String
-        public let reportIdentity: String
-        public let schemaFingerprint: String
+        public let logicalReportIdentity: String
         public let granularity: ASCReportGranularity?
         public let eventDate: ASCCalendarDate
+    }
+
+    /// The stable logical report identity of a record: the API report id,
+    /// else the report name, else the order-insensitive canonical column
+    /// set identity.
+    public static func logicalReportIdentity(of provenance: ASCReportProvenance) -> String {
+        if let reportID = provenance.reportID {
+            return "id:\(reportID)"
+        }
+        if let reportName = provenance.reportName {
+            return "name:\(reportName)"
+        }
+        if let canonical = provenance.canonicalSchemaIdentity {
+            return "schema:\(canonical)"
+        }
+        // Legacy provenance without a canonical identity: fall back to the
+        // order-sensitive fingerprint rather than merging everything.
+        return "schema:\(provenance.schemaFingerprint)"
     }
 
     /// Builds the selection key of a record.
     public static func selectionKey<Record: ASCAnalyticsEventRecord>(
         _ entry: ASCProvenancedRecord<Record>
     ) -> SelectionKey {
-        let reportIdentity = entry.provenance.reportID
-            ?? entry.provenance.reportName
-            ?? entry.provenance.category
-            ?? "unknown"
-        return SelectionKey(
+        SelectionKey(
             appIdentifier: entry.record.appAppleIdentifier,
-            reportIdentity: reportIdentity,
-            schemaFingerprint: entry.provenance.schemaFingerprint,
+            logicalReportIdentity: logicalReportIdentity(of: entry.provenance),
             granularity: entry.provenance.granularity,
             eventDate: entry.record.eventDate
         )
     }
 
-    /// Keeps, for every (app, report, variant, granularity, event date)
-    /// group, only records whose instance has the latest processing date
-    /// among the records of that group.
+    /// Keeps, for every (app, logical report variant, granularity, event
+    /// date) group, only records whose instance has the latest processing
+    /// date among the records of that group.
     ///
     /// Records without a processing date (for example hand-parsed files)
     /// count as the oldest: they are kept only when no dated instance
@@ -303,43 +417,73 @@ public enum ASCInstanceSelection {
 
 extension ASCAnalyticsStore {
     /// Returns download records after applying Apple's latest-processing-
-    /// date overwrite rule *within* each (app, report, variant,
-    /// granularity, event date) group. This is the reliable
-    /// "currently effective data" path: callers never need to apply
+    /// date overwrite rule *within* each (app, logical report variant,
+    /// granularity, event date) group. This is the reliable "currently
+    /// effective data" path: callers never need to apply
     /// `ASCInstanceSelection` by hand or guess when it applies.
     ///
     /// With the default `scope: .current`, superseded and pending-review
     /// ingestions are excluded before selection. Records from different
-    /// apps, reports, variants (standard/detailed), or granularities are
-    /// never overwritten by each other — callers must still avoid summing
-    /// across variants or granularities, which would double count the
-    /// same underlying events.
+    /// apps, logical report variants (standard/detailed), or granularities
+    /// are never overwritten by each other. To aggregate a single scope,
+    /// pass `granularities` / `reportIdentities` — summing across variants
+    /// or granularities would double count the same underlying events.
     public func effectiveDownloadRecords(
         appIdentifiers: Set<String>? = nil,
+        granularities: Set<ASCReportGranularity>? = nil,
+        reportIdentities: Set<String>? = nil,
         in range: ASCDateRange? = nil,
         scope: ASCIngestionQueryScope = .current
     ) async throws -> [ASCProvenancedRecord<ASCDownloadRecord>] {
-        ASCInstanceSelection.latestProcessingDatePerEventDate(
+        var records = ASCInstanceSelection.latestProcessingDatePerEventDate(
             try await downloadRecords(
                 appIdentifiers: appIdentifiers,
                 in: range,
                 scope: scope
             )
         )
+        if let granularities {
+            records = records.filter { entry in
+                entry.provenance.granularity.map { granularities.contains($0) } ?? false
+            }
+        }
+        if let reportIdentities {
+            records = records.filter { entry in
+                reportIdentities.contains(
+                    ASCInstanceSelection.logicalReportIdentity(of: entry.provenance)
+                )
+            }
+        }
+        return records
     }
 
     /// Same as `effectiveDownloadRecords` for discovery records.
     public func effectiveDiscoveryRecords(
         appIdentifiers: Set<String>? = nil,
+        granularities: Set<ASCReportGranularity>? = nil,
+        reportIdentities: Set<String>? = nil,
         in range: ASCDateRange? = nil,
         scope: ASCIngestionQueryScope = .current
     ) async throws -> [ASCProvenancedRecord<ASCDiscoveryRecord>] {
-        ASCInstanceSelection.latestProcessingDatePerEventDate(
+        var records = ASCInstanceSelection.latestProcessingDatePerEventDate(
             try await discoveryRecords(
                 appIdentifiers: appIdentifiers,
                 in: range,
                 scope: scope
             )
         )
+        if let granularities {
+            records = records.filter { entry in
+                entry.provenance.granularity.map { granularities.contains($0) } ?? false
+            }
+        }
+        if let reportIdentities {
+            records = records.filter { entry in
+                reportIdentities.contains(
+                    ASCInstanceSelection.logicalReportIdentity(of: entry.provenance)
+                )
+            }
+        }
+        return records
     }
 }

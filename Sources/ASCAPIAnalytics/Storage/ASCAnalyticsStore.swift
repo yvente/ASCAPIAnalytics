@@ -214,12 +214,15 @@ public protocol ASCAnalyticsStoreTransaction: AnyObject, Sendable {
     ///     Apple identifiers (direct rows) — `nil` disables the filter.
     ///   - parentIdentifiers: restrict to in-app purchase rows attributed
     ///     to these parent identifiers — `nil` disables the filter.
+    ///   - salesReportKinds: restrict to these report kinds — `nil`
+    ///     disables the filter.
     ///   - range: restrict to records whose Begin Date intersects the
     ///     range — `nil` disables the filter.
     ///   - scope: which ingestion states to include.
     func salesRecords(
         appAppleIdentifiers: Set<String>?,
         parentIdentifiers: Set<String>?,
+        salesReportKinds: Set<String>?,
         in range: ASCDateRange?,
         scope: ASCIngestionQueryScope
     ) async throws -> [ASCProvenancedRecord<ASCSalesRecord>]
@@ -269,12 +272,19 @@ public protocol ASCAnalyticsStore: Sendable {
     ///     A record matches when either filter applies to it (OR across
     ///     the two namespaces), so one app's direct sales and its
     ///     in-app purchases are retrievable together.
+    ///   - salesReportKinds: restrict to these report kinds
+    ///     (`"TYPE/SUBTYPE/FREQUENCY"`, as stored in
+    ///     `ASCReportProvenance.salesReportKind`) — `nil` disables the
+    ///     filter. Daily, weekly, and monthly reports of the same dates
+    ///     must be selected explicitly; summing across kinds double
+    ///     counts overlapping periods.
     ///   - range: restrict to records whose Begin Date intersects the
     ///     range — `nil` disables the filter.
     ///   - scope: which ingestion states to include.
     func salesRecords(
         appAppleIdentifiers: Set<String>?,
         parentIdentifiers: Set<String>?,
+        salesReportKinds: Set<String>?,
         in range: ASCDateRange?,
         scope: ASCIngestionQueryScope
     ) async throws -> [ASCProvenancedRecord<ASCSalesRecord>]
@@ -314,5 +324,42 @@ extension ASCAnalyticsStore {
             try? await transaction.rollback()
             throw error
         }
+    }
+}
+
+
+extension ASCAnalyticsStore {
+    /// Sales query without report-kind selection (all kinds).
+    public func salesRecords(
+        appAppleIdentifiers: Set<String>? = nil,
+        parentIdentifiers: Set<String>? = nil,
+        in range: ASCDateRange? = nil,
+        scope: ASCIngestionQueryScope = .current
+    ) async throws -> [ASCProvenancedRecord<ASCSalesRecord>] {
+        try await salesRecords(
+            appAppleIdentifiers: appAppleIdentifiers,
+            parentIdentifiers: parentIdentifiers,
+            salesReportKinds: nil,
+            in: range,
+            scope: scope
+        )
+    }
+}
+
+extension ASCAnalyticsStoreTransaction {
+    /// Sales query without report-kind selection (all kinds).
+    public func salesRecords(
+        appAppleIdentifiers: Set<String>? = nil,
+        parentIdentifiers: Set<String>? = nil,
+        in range: ASCDateRange? = nil,
+        scope: ASCIngestionQueryScope = .current
+    ) async throws -> [ASCProvenancedRecord<ASCSalesRecord>] {
+        try await salesRecords(
+            appAppleIdentifiers: appAppleIdentifiers,
+            parentIdentifiers: parentIdentifiers,
+            salesReportKinds: nil,
+            in: range,
+            scope: scope
+        )
     }
 }
