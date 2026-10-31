@@ -144,6 +144,20 @@ See [VALIDATION_MATRIX.md](VALIDATION_MATRIX.md). In short:
 4. **LEVEL 4 — METRICS_RECONCILED**: same-basis expected figures
    reconciled for the specific metrics and scope (implies LEVEL 3).
 
-Levels cannot be skipped. Without a real private report the package can
-honestly claim LEVEL 2 at most — and says so explicitly
-(`REAL_APPLE_REPORT_VALIDATION = NOT_RUN_NO_PRIVATE_REPORT`).
+Levels cannot be skipped. Without successful validation against a real
+Apple report, an individual report family can claim LEVEL 2 at most.
+
+Current verification status:
+
+- Summary Sales: LEVEL 3 — REAL_REPORT_PARSED. One private Apple Daily
+  Summary Sales report passed the production parser locally on
+  2026-10-31.
+- App Downloads: LEVEL 2 — no private real report validated yet.
+- App Store Discovery and Engagement: LEVEL 2 — no private real report
+  validated yet.
+- LEVEL 4 requires independent reconciliation against figures with
+  matching report type, date range, currency, territory, and metric
+  definitions.
+
+Real report files and private expected values must never be committed
+to the repository or uploaded to CI.

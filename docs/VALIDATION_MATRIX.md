@@ -47,9 +47,9 @@ on **2026-10-31**:
 | Supported header | All 19 documented columns; name-based lookup, order-independent |
 | Verified fields | Begin/End Date (`MM/DD/YYYY`), Apple Identifier, SKU, Parent Identifier (parent-app SKU for IAP), Product Type Identifier (full published table), Units `DECIMAL(18,2)`, Customer Price, Customer Currency, Developer Proceeds **(per unit)**, Currency of Proceeds, Country Code, CMB/CMB-C |
 | Sign rules | Apple's examples pinned in tests: refunds have negative Units and Customer Price with **positive** per-unit proceeds (`-50 / .7 / -.99`); CMB-C credits follow the same convention |
-| Synthetic fixtures | **PASS** — 24 parser tests: app sales, IAP, subscriptions, refunds, partial refunds (Units 0), free/zero-price, updates, re-downloads, bundles with CMB-C, multi-currency, per-unit proceeds math, unknown product types, column reorders, compatible extra columns, gzip input |
-| Real Apple report | **NOT RUN — no private report available** |
-| Metrics reconciliation | **NOT RUN** — requires a real report and same-basis expected figures |
+| Synthetic fixtures | **PASS** — 28 parser tests: app sales, IAP, subscriptions, refunds, partial refunds (Units 0), free/zero-price, updates, re-downloads, bundles with CMB-C, multi-currency, per-unit proceeds math, unknown product types, blank proceeds currency on zero-value rows, column reorders, compatible extra columns, gzip input |
+| Real Apple report | **PASS — LEVEL 3 (REAL_REPORT_PARSED)**. A private Apple Summary Daily Sales report was parsed locally on 2026-10-31; all 64 data rows passed the production parser. No raw report data was committed or uploaded. |
+| Metrics reconciliation | **NOT RUN — LEVEL 4 not achieved.** No independent, same-scope expected figures were provided. Successful parsing and metric calculation do not establish agreement with App Store Connect dashboard totals. |
 | Unknown-field policy | Extra columns preserved verbatim in `extraFields`; unknown product types/CMB values surfaced in `unknownProductTypeIdentifiers` / metrics, never folded into known buckets |
 | Money / date basis | `Decimal` only; gross sales grouped by Customer Currency, proceeds by Currency of Proceeds (never mixed); dates are Apple's transaction window (`MM/DD/YYYY`) — a different basis from Analytics event days |
 | Dashboard consistency | **Not asserted.** Proceeds are per-unit values; multi-currency proceeds are never summed or converted. Same-basis reconciliation is possible locally via the `--expected` file (single currency at a time) |

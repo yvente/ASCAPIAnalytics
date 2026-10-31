@@ -39,7 +39,7 @@ Required columns parsed (version 1_3):
 | Customer Price | `DECIMAL(18,2)` | Per unit, Customer Currency; negative = refund or CMB-C credit |
 | Customer Currency | `CHAR(3)` | ISO code |
 | Developer Proceeds | `DECIMAL(18,2)` | **Per unit**, Currency of Proceeds; **positive** on refund rows |
-| Currency of Proceeds | `CHAR(3)` | ISO code — a different currency space from Customer Currency. **Real-report observation (2026-10-28 Daily Summary): Apple leaves this column blank on zero-price, zero-proceeds rows (free downloads/updates).** The parser therefore accepts a blank value only when both amounts are zero and represents it as `nil` — never a fabricated currency. A populated value must still be a 3-letter ISO code; a monetary row (non-zero price or proceeds) without a proceeds currency is a hard error. |
+| Currency of Proceeds | `CHAR(3)` | Proceeds currency. A real Apple Daily Summary report contained blank values for zero-price, zero-proceeds rows. The parser represents these as `nil` and excludes them from proceeds currency buckets. When present, the value must be a valid three-letter currency code. A row with non-zero Customer Price or Developer Proceeds must provide a proceeds currency. |
 | Country Code | `CHAR(2)` | ISO storefront code |
 | CMB | `VARCHAR(5)` | `CMB` = completes an app bundle; `CMB-C` = credit for a previously purchased app; blank otherwise |
 
@@ -133,9 +133,14 @@ error.
 parses a local report file with the exact parsers described here and
 reports format validity, schema identity, unknown values, and optional
 single-currency reconciliation — fully offline, no raw rows printed.
-Current per-report verification levels live in
-[VALIDATION_MATRIX.md](VALIDATION_MATRIX.md) (LEVEL 2 everywhere;
-`REAL_APPLE_REPORT_VALIDATION = NOT_RUN_NO_PRIVATE_REPORT`).
+Current per-report verification levels are maintained in
+[VALIDATION_MATRIX.md](VALIDATION_MATRIX.md):
+
+- Summary Sales: LEVEL 3 — REAL_REPORT_PARSED (one private Apple Daily
+  Summary report successfully parsed locally).
+- App Downloads: LEVEL 2 — OFFICIAL_FORMAT_VERIFIED.
+- App Store Discovery and Engagement: LEVEL 2 — OFFICIAL_FORMAT_VERIFIED.
+- LEVEL 4 — METRICS_RECONCILED has not yet been achieved.
 
 ## Parsing ground rules (enforced in code)
 
