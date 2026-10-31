@@ -266,6 +266,6 @@ public struct ASCDownloadsReportParser: Sendable {
     )
 }
 
-extension ASCDownloadRecord: ASCEventDated {
+extension ASCDownloadRecord: ASCEventDated, ASCAnalyticsEventRecord {
     public var eventDate: ASCCalendarDate { date }
 }

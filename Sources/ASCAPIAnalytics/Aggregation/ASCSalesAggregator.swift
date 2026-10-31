@@ -47,22 +47,11 @@ public struct ASCSalesFilter: Hashable, Codable, Sendable {
         if let range = dateRange, !range.contains(record.beginDate) {
             return false
         }
-        if let identifiers = appAppleIdentifiers {
-            var matches = false
-            if case .appleIdentifier(let id) = record.appAttribution,
-               identifiers.contains(id) {
-                matches = true
-            }
-            if let parents = parentIdentifiers,
-               case .parentIdentifierSKU(let sku) = record.appAttribution,
-               parents.contains(sku) {
-                matches = true
-            }
-            if !matches { return false }
-        } else if let parents = parentIdentifiers {
-            guard case .parentIdentifierSKU(let sku) = record.appAttribution,
-                  parents.contains(sku)
-            else { return false }
+        guard record.appAttribution.matches(
+            appAppleIdentifiers: appAppleIdentifiers,
+            parentIdentifiers: parentIdentifiers
+        ) else {
+            return false
         }
         if let territories, !territories.contains(record.countryCode) {
             return false

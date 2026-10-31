@@ -102,6 +102,13 @@ discoverySummary.totals.combinedUniqueImpressionCounts
 Apple's definition (Analytics metric definitions): *"Total downloads and
 pre-orders divided by unique device impressions."*
 
+**Basis caveat:** Apple's dashboard denominator ("Impressions (Unique
+Devices)") includes unique product page views. The Discovery report
+records impressions and page views as separate events whose per-device
+overlap is not published — so a denominator derived from the report
+cannot be proven to match Apple's basis, and the report-based helper
+always returns `unavailable`:
+
 ```swift
 let aggregator = ASCAnalyticsAggregator()
 let rate = aggregator.conversionRate(
@@ -112,17 +119,33 @@ let rate = aggregator.conversionRate(
         dateRange: ASCDateRange.singleDay(ASCCalendarDate(iso8601Day: "2025-10-01")!)
     )
 )
+// .unavailable(reason: "…dashboard Impressions include unique product
+//  page views…")
+```
 
-switch rate {
-case .available(let rate, let numerator, let denominator):
-    // exact, single-day, single deduplication domain
-case .estimated(let rate, _, _, let note):
-    // explicitly labeled lower bound (multi-day denominator)
-case .unavailable(let reason):
-    // windows differ, dimension splits, zero impressions, …
-case .unsupported(let reason):
-    // never produced for conversion rate; used for D1/D7/D35 cohorts
-}
+A rate is returned only when you can **assert** the denominator equals
+Apple's dashboard basis (for example read from the dashboard itself), the
+window is a single day, and the impressions span one deduplication
+domain:
+
+```swift
+let exact = ASCConversionRateEvaluator.evaluate(
+    ASCConversionRateInputs(
+        numeratorAppIdentifier: "1234567890",
+        numeratorWindow: ASCDateRange.singleDay(ASCCalendarDate(iso8601Day: "2025-10-01")!),
+        // each download once + each pre-order placement once (placements
+        // come from the Pre-orders report — the downloads report's
+        // Pre-Order flag marks downloads that came from a pre-order and
+        // is already inside the download counts)
+        downloadsAndPreOrders: 12,
+        denominatorAppIdentifier: "1234567890",
+        denominatorWindow: ASCDateRange.singleDay(ASCCalendarDate(iso8601Day: "2025-10-01")!),
+        uniqueDeviceImpressions: 150,
+        impressionsDeduplicationDomainCount: 1,
+        denominatorBasis: .assertedDashboardUniqueDevices
+    )
+)
+// .available(rate: 0.08, numerator: 12, denominator: 150)
 ```
 
 D1/D7/D35 download-to-paid and retention cohorts are unsupported and

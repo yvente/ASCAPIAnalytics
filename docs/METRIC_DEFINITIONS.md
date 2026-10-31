@@ -26,9 +26,9 @@ Conventions:
 | Auto-updates | The device replaced the app with another version automatically. | App Downloads report | Additive | **Supported** |
 | Restores | Restoring an app from iCloud Backup. | App Downloads report | Additive | **Supported** |
 | Total downloads | "The sum of First Time Downloads and Redownloads." Updates are a separate metric. | Derived | Additive | **Supported** |
-| Pre-orders (as visible here) | Rows of the downloads report whose `Pre-Order` flag is true. Apple's own Pre-Orders metric ("placed, minus cancelations") subtracts cancellations, which the downloads report does not expose. | App Downloads report | Additive | **Supported, with the cancellation caveat** |
+| Downloads from pre-orders | Rows of the downloads report whose `Pre-Order` flag is true. **This flag marks downloads that came from a pre-order — they are already inside the download-type buckets above and are NOT independent pre-order placements.** Apple's Pre-Orders metric ("The total number of pre-orders placed, minus cancelations") lives in the App Store Pre-orders report and is not computable from the downloads report. Never add these counts on top of Total Downloads — that would double count. | App Downloads report | Additive | **Supported (downloads from pre-orders); pre-order placements unsupported** |
 | Impressions (counts) | "The number of times your app was viewed on the Today, Games, Apps, and Search tabs of the App Store for more than one second. Includes product page views." | Discovery and Engagement report, `Event` = Impression, `Counts` | Additive | **Supported** |
-| Impressions (unique devices) | "The number of unique devices that have viewed your app on the Today, Games, Apps, and Search tabs of the App Store." | Discovery and Engagement report, `Unique Counts` | **Non-additive** — Apple deduplicates per date and per dimension combination; sums across dates or dimensions double-count devices | **Supported per domain; combined value unavailable outside a single domain** |
+| Impressions (unique devices) | "The number of unique devices that have viewed your app on the Today, Games, Apps, and Search tabs of the App Store. Includes unique product page views." Apple's dashboard Impressions therefore cover **both** impression events **and** product page views, while the Discovery report records them as separate events whose per-device overlap is not published. | Discovery and Engagement report, `Unique Counts` | **Non-additive** — Apple deduplicates per date and per dimension combination; sums across dates, dimensions, **or event types** double-count devices | **Supported per domain and per event type; a combined dashboard-basis value is unavailable from published reports** |
 | Product page views (counts) | "The total number of times your App Store product page was viewed." | Discovery and Engagement report, `Event` = Page view, `Counts` | Additive | **Supported** |
 | Product page views (unique devices) | "The number of unique devices that have viewed your App Store product page." | Discovery and Engagement report, `Unique Counts` | Non-additive (as above) | **Supported per domain; combined unavailable** |
 
@@ -43,19 +43,51 @@ device."*
 > is **not** "downloads divided by product page views". The denominator is
 > **unique device impressions**, and the numerator includes **pre-orders**.
 
+**Denominator basis (critical):** Apple's dashboard denominator is
+*"Impressions (Unique Devices)"*, which **includes unique product page
+views**. The App Store Discovery and Engagement report records
+impressions and page views as separate events, and the per-device overlap
+between the two event types is not published. A denominator derived from
+the report's impression events alone is therefore **narrower than Apple's
+basis by an unknowable amount**, and no exact dashboard-basis denominator
+can be reconstructed from published report files.
+
+**Numerator composition:** "Total downloads and pre-orders" counts each
+download once and each pre-order *placement* once (Apple: a pre-order
+"counts towards your conversion rate" when placed and "is not counted
+again when it downloads to their device"). The downloads report's
+`Pre-Order` flag marks downloads that came from a pre-order — those rows
+are already inside the download counts and must never be added again.
+Placements come from the App Store Pre-orders report, which this package
+does not consume yet.
+
 Reproduction rules implemented by `ASCConversionRateEvaluator`:
 
+- The denominator must be **asserted** to be Apple's dashboard
+  "Impressions (Unique Devices)" basis
+  (`ASCImpressionBasis.assertedDashboardUniqueDevices` — for example read
+  from Apple's dashboard export). A denominator derived from
+  Discovery-report impression events only is refused with `unavailable`,
+  even when every other condition holds.
 - Numerator and denominator must cover the same app and the same window.
 - A rate is returned **only** when the window is a single day and the
   impression data spans exactly one deduplication domain (one date in one
   dimension combination). Otherwise the result is `unavailable` with the
   reason.
-- On explicit request (`evaluateAllowingEstimate`), a multi-day window may
-  return an `estimated` rate whose denominator is the sum of per-day
-  unique counts — an upper bound, so the estimated rate is a **lower
-  bound** of Apple's value. Dimension splits, app mismatches, and window
-  mismatches are never estimated.
+- On explicit request (`evaluateAllowingEstimate`), a multi-day window on
+  an asserted basis may return an `estimated` rate whose denominator is
+  the sum of per-day unique counts without cross-day device
+  deduplication. Because the true dashboard value is not reconstructable
+  from published data, the note **claims no mathematical bound
+  direction** — neither "lower bound" nor "upper bound" is provable.
+  Dimension splits, app mismatches, window mismatches, and report-derived
+  bases are never estimated.
 - Zero impressions yield `unavailable`, never a fabricated 0% or 100%.
+
+The `ASCAnalyticsAggregator.conversionRate` helper derives its inputs from
+report records and therefore **always returns `unavailable`** with the
+basis reason — the honest answer until a dashboard-basis denominator is
+supplied.
 
 | Status | Meaning |
 |---|---|

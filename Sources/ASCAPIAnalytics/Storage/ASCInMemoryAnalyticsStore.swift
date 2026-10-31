@@ -5,12 +5,19 @@ import Foundation
 /// This is the reference implementation for offline use, tests, and
 /// previews. It enforces the full transaction contract: mutations are
 /// staged inside the transaction, become visible to readers only on
-/// `commit`, and are completely discarded on `rollback`. One transaction
-/// is active at a time; a second `beginTransaction` fails with
-/// `ASCAnalyticsError.storeInconsistentState`.
+/// `commit`, and are completely discarded on `rollback`. One unfinished
+/// transaction is active at a time; a second `beginTransaction` fails with
+/// `ASCAnalyticsError.storeInconsistentState` while the first transaction
+/// object is still alive and unfinished. A transaction that is committed,
+/// rolled back, **or simply dropped by the caller** (for example when a
+/// task is cancelled between begin and commit) releases its slot, so a
+/// dropped transaction can never permanently block later syncs.
 public final class ASCInMemoryAnalyticsStore: ASCAnalyticsStore, @unchecked Sendable {
     private let lock = NSLock()
-    private var transactionActive = false
+    /// Weak reference to the live transaction. When the caller drops an
+    /// unfinished transaction, the object deallocates, this becomes `nil`,
+    /// and the slot is free again — no stale flag can remain behind.
+    private weak var activeTransaction: Transaction?
 
     // Committed state.
     private var ingestions: [ASCIngestionKey: ASCIngestionEntry] = [:]
@@ -27,23 +34,66 @@ public final class ASCInMemoryAnalyticsStore: ASCAnalyticsStore, @unchecked Send
     private func beginTransactionLocked() throws -> any ASCAnalyticsStoreTransaction {
         lock.lock()
         defer { lock.unlock() }
-        guard !transactionActive else {
+        if let current = activeTransaction, !current.isFinished {
             throw ASCAnalyticsError.storeInconsistentState(
                 reason: "another transaction is already active on this store"
             )
         }
-        transactionActive = true
-        return Transaction(store: self)
+        let transaction = Transaction(store: self)
+        activeTransaction = transaction
+        return transaction
+    }
+
+    /// Clears the active-transaction slot when the given transaction
+    /// finishes (commit or rollback).
+    fileprivate func transactionDidFinish(_ transaction: Transaction) {
+        lock.lock()
+        defer { lock.unlock() }
+        if activeTransaction === transaction {
+            activeTransaction = nil
+        }
     }
 
     // MARK: - Transaction
 
-    /// Stages mutations and applies them under the store lock.
-    private final class Transaction: ASCAnalyticsStoreTransaction, @unchecked Sendable {
+    /// Stages mutations and applies them under the store lock on commit.
+    ///
+    /// A transaction is intended for a single owner; concurrent mutation
+    /// of one transaction from multiple tasks is not supported. The
+    /// finished flag is a set-once leaf lock so the store can inspect it
+    /// without ordering hazards against its own lock.
+    fileprivate final class Transaction: ASCAnalyticsStoreTransaction, @unchecked Sendable {
         private unowned let store: ASCInMemoryAnalyticsStore
-        private let lock = NSLock()
-        private var committed = false
-        private var rolledBack = false
+
+        private let finishedLock = NSLock()
+        private var finishedStorage = false
+
+        /// Whether the transaction has been committed or rolled back.
+        /// Safe to read while holding the store lock (leaf lock, no
+        /// ordering with the store lock).
+        fileprivate var isFinished: Bool {
+            finishedLock.lock()
+            defer { finishedLock.unlock() }
+            return finishedStorage
+        }
+
+        /// Marks the transaction finished exactly once; returns `false`
+        /// when it was already finished.
+        private func finishOnce() -> Bool {
+            finishedLock.lock()
+            defer { finishedLock.unlock() }
+            if finishedStorage { return false }
+            finishedStorage = true
+            return true
+        }
+
+        private func ensureActive() throws {
+            if isFinished {
+                throw ASCAnalyticsError.storeInconsistentState(
+                    reason: "transaction already finished"
+                )
+            }
+        }
 
         private var ingestions: [ASCIngestionKey: ASCIngestionEntry] = [:]
         private var superseded: [ASCIngestionKey: ASCIngestionEntry] = [:]
@@ -55,119 +105,79 @@ public final class ASCInMemoryAnalyticsStore: ASCAnalyticsStore, @unchecked Send
             self.store = store
         }
 
-        private func withLock<T>(_ body: () throws -> T) rethrows -> T {
-            lock.lock()
-            defer { lock.unlock() }
-            return try body()
-        }
-
         func commit() async throws {
-            try withLock {
-                guard !committed, !rolledBack else {
-                    throw ASCAnalyticsError.storeInconsistentState(
-                        reason: "transaction already finished"
-                    )
-                }
-                committed = true
+            guard finishOnce() else {
+                throw ASCAnalyticsError.storeInconsistentState(
+                    reason: "transaction already finished"
+                )
             }
             store.applyTransaction(self)
+            store.transactionDidFinish(self)
         }
 
         func rollback() async throws {
-            try withLock {
-                guard !committed, !rolledBack else {
-                    throw ASCAnalyticsError.storeInconsistentState(
-                        reason: "transaction already finished"
-                    )
-                }
-                rolledBack = true
-                ingestions = [:]
-                superseded = [:]
-                sales = [:]
-                downloads = [:]
-                discovery = [:]
+            guard finishOnce() else {
+                throw ASCAnalyticsError.storeInconsistentState(
+                    reason: "transaction already finished"
+                )
             }
-            // Release the store's single-transaction slot.
-            store.discardTransaction()
+            // Staged mutations are simply never applied.
+            store.transactionDidFinish(self)
         }
 
         func upsertIngestion(_ entry: ASCIngestionEntry) async throws {
-            try withLock {
-                guard !committed, !rolledBack else {
-                    throw ASCAnalyticsError.storeInconsistentState(
-                        reason: "transaction already finished"
-                    )
-                }
-                ingestions[entry.key] = entry
-            }
+            try ensureActive()
+            ingestions[entry.key] = entry
         }
 
         func ingestion(matching key: ASCIngestionKey) async throws -> ASCIngestionEntry? {
-            try withLock {
-                guard !committed, !rolledBack else {
-                    throw ASCAnalyticsError.storeInconsistentState(
-                        reason: "transaction already finished"
-                    )
-                }
-                if let staged = ingestions[key] ?? superseded[key] {
-                    return staged
-                }
-                return store.lookupIngestion(matching: key)
+            try ensureActive()
+            if let staged = ingestions[key] ?? superseded[key] {
+                return staged
             }
+            return store.lookupIngestion(matching: key)
         }
 
         func ingestionEntries(state: ASCIngestionState?) async throws -> [ASCIngestionEntry] {
-            try withLock {
-                guard !committed, !rolledBack else {
-                    throw ASCAnalyticsError.storeInconsistentState(
-                        reason: "transaction already finished"
-                    )
+            try ensureActive()
+            let staged = Array(ingestions.values) + Array(superseded.values)
+            let committedEntries = store.allIngestionEntries()
+            return (committedEntries + staged)
+                .filter { state == nil || $0.state == state }
+                .reduce(into: [ASCIngestionKey: ASCIngestionEntry]()) {
+                    $0[$1.key] = $1
                 }
-                let staged = Array(ingestions.values) + Array(superseded.values)
-                let committedEntries = store.allIngestionEntries()
-                return (committedEntries + staged)
-                    .filter { state == nil || $0.state == state }
-                    .reduce(into: [ASCIngestionKey: ASCIngestionEntry]()) {
-                        $0[$1.key] = $1
-                    }
-                    .map(\.value)
-                    .sorted { $0.importedAt < $1.importedAt }
-            }
+                .map(\.value)
+                .sorted { $0.importedAt < $1.importedAt }
         }
 
         func markSuperseded(keys: [ASCIngestionKey], by: ASCIngestionKey) async throws {
-            try withLock {
-                guard !committed, !rolledBack else {
-                    throw ASCAnalyticsError.storeInconsistentState(
-                        reason: "transaction already finished"
+            try ensureActive()
+            for key in keys {
+                let entry = ingestions[key] ?? store.lookupIngestion(matching: key)
+                guard let entry else { continue }
+                var supersededEntry = entry
+                if supersededEntry.state == .imported {
+                    supersededEntry = ASCIngestionEntry(
+                        key: supersededEntry.key,
+                        state: .superseded,
+                        processingDate: supersededEntry.processingDate,
+                        granularity: supersededEntry.granularity,
+                        reportName: supersededEntry.reportName,
+                        category: supersededEntry.category,
+                        appAppleIdentifier: supersededEntry.appAppleIdentifier,
+                        segmentIDs: supersededEntry.segmentIDs,
+                        segmentChecksums: supersededEntry.segmentChecksums,
+                        schemaFingerprint: supersededEntry.schemaFingerprint,
+                        contentChecksum: supersededEntry.contentChecksum,
+                        recordCount: supersededEntry.recordCount,
+                        importedAt: supersededEntry.importedAt,
+                        pendingReason: supersededEntry.pendingReason,
+                        supersededBy: by
                     )
                 }
-                for key in keys {
-                    let entry = ingestions[key] ?? store.lookupIngestion(matching: key)
-                    guard let entry else { continue }
-                    var supersededEntry = entry
-                    if supersededEntry.state == .imported {
-                        supersededEntry = ASCIngestionEntry(
-                            key: supersededEntry.key,
-                            state: .superseded,
-                            processingDate: supersededEntry.processingDate,
-                            granularity: supersededEntry.granularity,
-                            reportName: supersededEntry.reportName,
-                            category: supersededEntry.category,
-                            appAppleIdentifier: supersededEntry.appAppleIdentifier,
-                            segmentIDs: supersededEntry.segmentIDs,
-                            segmentChecksums: supersededEntry.segmentChecksums,
-                            schemaFingerprint: supersededEntry.schemaFingerprint,
-                            contentChecksum: supersededEntry.contentChecksum,
-                            recordCount: supersededEntry.recordCount,
-                            importedAt: supersededEntry.importedAt,
-                            pendingReason: supersededEntry.pendingReason,
-                            supersededBy: by
-                        )
-                    }
-                    superseded[key] = supersededEntry
-                    ingestions[key] = nil
-                }
+                superseded[key] = supersededEntry
+                ingestions[key] = nil
             }
         }
 
@@ -175,27 +185,24 @@ public final class ASCInMemoryAnalyticsStore: ASCAnalyticsStore, @unchecked Send
             _ records: [ASCProvenancedRecord<ASCSalesRecord>],
             ingestionKey: ASCIngestionKey
         ) async throws {
-            withLock {
-                sales[ingestionKey, default: []].append(contentsOf: records)
-            }
+            try ensureActive()
+            sales[ingestionKey, default: []].append(contentsOf: records)
         }
 
         func insertDownloads(
             _ records: [ASCProvenancedRecord<ASCDownloadRecord>],
             ingestionKey: ASCIngestionKey
         ) async throws {
-            withLock {
-                downloads[ingestionKey, default: []].append(contentsOf: records)
-            }
+            try ensureActive()
+            downloads[ingestionKey, default: []].append(contentsOf: records)
         }
 
         func insertDiscovery(
             _ records: [ASCProvenancedRecord<ASCDiscoveryRecord>],
             ingestionKey: ASCIngestionKey
         ) async throws {
-            withLock {
-                discovery[ingestionKey, default: []].append(contentsOf: records)
-            }
+            try ensureActive()
+            discovery[ingestionKey, default: []].append(contentsOf: records)
         }
 
         func salesRecords(
@@ -206,13 +213,7 @@ public final class ASCInMemoryAnalyticsStore: ASCAnalyticsStore, @unchecked Send
         ) async throws -> [ASCProvenancedRecord<ASCSalesRecord>] {
             // A transaction's queries see committed state only: staged
             // mutations are invisible until commit.
-            try withLock {
-                guard !committed, !rolledBack else {
-                    throw ASCAnalyticsError.storeInconsistentState(
-                        reason: "transaction already finished"
-                    )
-                }
-            }
+            try ensureActive()
             return try await store.salesRecords(
                 appAppleIdentifiers: appAppleIdentifiers,
                 parentIdentifiers: parentIdentifiers,
@@ -226,13 +227,7 @@ public final class ASCInMemoryAnalyticsStore: ASCAnalyticsStore, @unchecked Send
             in range: ASCDateRange?,
             scope: ASCIngestionQueryScope
         ) async throws -> [ASCProvenancedRecord<ASCDownloadRecord>] {
-            try withLock {
-                guard !committed, !rolledBack else {
-                    throw ASCAnalyticsError.storeInconsistentState(
-                        reason: "transaction already finished"
-                    )
-                }
-            }
+            try ensureActive()
             return try await store.downloadRecords(
                 appIdentifiers: appIdentifiers,
                 in: range,
@@ -245,13 +240,7 @@ public final class ASCInMemoryAnalyticsStore: ASCAnalyticsStore, @unchecked Send
             in range: ASCDateRange?,
             scope: ASCIngestionQueryScope
         ) async throws -> [ASCProvenancedRecord<ASCDiscoveryRecord>] {
-            try withLock {
-                guard !committed, !rolledBack else {
-                    throw ASCAnalyticsError.storeInconsistentState(
-                        reason: "transaction already finished"
-                    )
-                }
-            }
+            try ensureActive()
             return try await store.discoveryRecords(
                 appIdentifiers: appIdentifiers,
                 in: range,
@@ -294,15 +283,6 @@ public final class ASCInMemoryAnalyticsStore: ASCAnalyticsStore, @unchecked Send
             downloads: &downloadsByIngestion,
             discovery: &discoveryByIngestion
         )
-        transactionActive = false
-    }
-
-    /// Aborts an active transaction without touching committed state; used
-    /// when a caller drops a transaction. Not part of the public protocol.
-    func discardTransaction() {
-        lock.lock()
-        defer { lock.unlock() }
-        transactionActive = false
     }
 
     // MARK: - Committed-state readers (store-locked)
@@ -386,16 +366,15 @@ public final class ASCInMemoryAnalyticsStore: ASCAnalyticsStore, @unchecked Send
             guard isIncludedLocked(key, scope: scope) else { continue }
             for entry in records {
                 let record = entry.record
-                if let identifiers = appAppleIdentifiers {
-                    guard case .appleIdentifier(let id) = record.appAttribution,
-                          identifiers.contains(id)
-                    else { continue }
-                }
-                if let parents = parentIdentifiers {
-                    guard case .parentIdentifierSKU(let sku) = record.appAttribution,
-                          parents.contains(sku)
-                    else { continue }
-                }
+                // Same attribution semantics as `ASCSalesFilter`: a record
+                // matches when its Apple Identifier is in the direct set
+                // OR its Parent Identifier SKU is in the parent set, so
+                // one app's direct sales and its in-app purchases are
+                // retrievable together.
+                guard record.appAttribution.matches(
+                    appAppleIdentifiers: appAppleIdentifiers,
+                    parentIdentifiers: parentIdentifiers
+                ) else { continue }
                 if let range {
                     guard range.contains(record.beginDate) || range.contains(record.endDate) else {
                         continue
@@ -465,16 +444,19 @@ public final class ASCInMemoryAnalyticsStore: ASCAnalyticsStore, @unchecked Send
 
 extension ASCIngestionKey {
     /// Whether this entry key matches a lookup key. Every non-nil field of
-    /// the lookup must be equal; nil lookup fields match anything. A
-    /// lookup `sourceKind` of `.unknown` acts as a wildcard, because the
-    /// sync engine looks up analytics ingestions by instance identity
-    /// before parsing determines the report family.
+    /// the lookup must be equal; `reportVersion` matching is **exact** — a
+    /// `nil` lookup version only matches `nil` entry versions, never an
+    /// explicitly versioned import. A lookup `sourceKind` of `.unknown`
+    /// acts as a wildcard, because the sync engine looks up analytics
+    /// ingestions by instance identity before parsing determines the
+    /// report family.
     func matches(_ lookup: ASCIngestionKey) -> Bool {
         if lookup.sourceKind != .unknown && lookup.sourceKind != sourceKind { return false }
         if let instanceID = lookup.instanceID, instanceID != self.instanceID { return false }
         if let vendorNumber = lookup.vendorNumber, vendorNumber != self.vendorNumber { return false }
+        if let salesReportKind = lookup.salesReportKind, salesReportKind != self.salesReportKind { return false }
         if let reportDate = lookup.reportDate, reportDate != self.reportDate { return false }
-        if let reportVersion = lookup.reportVersion, reportVersion != self.reportVersion { return false }
+        if lookup.reportVersion != self.reportVersion { return false }
         if let deliveryID = lookup.deliveryID, deliveryID != self.deliveryID { return false }
         return true
     }

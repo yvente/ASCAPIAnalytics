@@ -218,4 +218,95 @@ final class ASCGzipDecoderTests: XCTestCase {
             XCTAssertEqual(error as? ASCAnalyticsError, .gzipMemberLimitExceeded(limit: 2))
         }
     }
+
+    // MARK: - Review regressions: boundary safety
+
+    func testTrailingLoneMagicByteIsStructuredErrorNotCrash() throws {
+        // A valid member followed by a single 0x1F byte: reading the
+        // second magic byte must be bounds-checked, never crash.
+        var fixture = ASCGzipFixture.gzip(payload: Data("payload".utf8))
+        fixture.append(0x1F)
+        assertThrowsASCError(try decoder.decode(fixture)) { error in
+            guard case .gzipTrailingData = error else {
+                return XCTFail("expected gzipTrailingData, got \(error)")
+            }
+        }
+    }
+
+    func testTruncatedSecondMemberHeaderIsStructuredError() {
+        let first = ASCGzipFixture.gzip(payload: Data("one".utf8))
+        // A second member cut off inside its fixed header.
+        var truncatedMember = Data([0x1F, 0x8B, 0x08])
+        let fixture = ASCGzipFixture.concatenated([first, truncatedMember])
+        _ = truncatedMember
+        assertThrowsASCError(try decoder.decode(fixture)) { error in
+            XCTAssertEqual(error, .gzipHeaderTruncated)
+        }
+    }
+
+    func testNonFinalStoredBlockNeverCompletes() throws {
+        // A stored block whose BFINAL bit is 0: the stream never ends, so
+        // under FINALIZE the decoder cannot complete and the failure must
+        // be a structured truncation/deflate error, never a hang or crash.
+        var data = Data()
+        data.append(0x1F)
+        data.append(0x8B)
+        data.append(0x08)
+        data.append(0x00)
+        data.append(contentsOf: LE(UInt32(0)))
+        data.append(0x00)
+        data.append(0x03)
+        // Stored block, NOT final (0x00), length 5, "hello".
+        data.append(0x00)
+        data.append(contentsOf: LE(UInt16(5)))
+        data.append(contentsOf: LE(UInt16(~UInt16(5))))
+        data.append(Data("hello".utf8))
+        // Trailer (would only matter if the stream ended).
+        data.append(contentsOf: LE(ASCGzipFixture.crc32(Data("hello".utf8))))
+        data.append(contentsOf: LE(UInt32(5)))
+
+        assertThrowsASCError(try decoder.decode(data)) { error in
+            switch error {
+            case .gzipStreamTruncated, .gzipDeflateFailed:
+                break // structured truncation/deflate errors are expected
+            default:
+                XCTFail("expected truncation or deflate failure, got \(error)")
+            }
+        }
+    }
+
+    func testZeroAndNegativeOutputLimitsAreSafe() throws {
+        let fixture = ASCGzipFixture.gzip(payload: Data("x".utf8))
+
+        let zeroLimit = ASCGzipDecoder(configuration: .init(maximumOutputSize: 0))
+        assertThrowsASCError(try zeroLimit.decode(fixture)) { error in
+            XCTAssertEqual(error, .gzipOutputLimitExceeded(limit: 0))
+        }
+
+        let negativeLimit = ASCGzipDecoder(configuration: .init(maximumOutputSize: -1))
+        assertThrowsASCError(try negativeLimit.decode(fixture)) { error in
+            XCTAssertEqual(error, .gzipOutputLimitExceeded(limit: -1))
+        }
+
+        // An empty payload produces zero output bytes and stays within a
+        // zero budget.
+        let emptyFixture = ASCGzipFixture.gzip(payload: Data())
+        XCTAssertEqual(try zeroLimit.decode(emptyFixture), Data())
+    }
+
+    func testRandomGarbageNeverCrashes() {
+        // Structured errors for arbitrary hostile input.
+        let inputs: [Data] = [
+            Data([0x1F]),
+            Data([0x1F, 0x8B]),
+            Data([0x1F, 0x8B, 0x08]),
+            Data(repeating: 0x1F, count: 64),
+            Data([0x00, 0x01, 0x02, 0x03]),
+        ]
+        for input in inputs {
+            XCTAssertThrowsError(try decoder.decode(input)) { error in
+                XCTAssertTrue(error is ASCAnalyticsError, "expected structured error, got \(error)")
+            }
+        }
+    }
 }

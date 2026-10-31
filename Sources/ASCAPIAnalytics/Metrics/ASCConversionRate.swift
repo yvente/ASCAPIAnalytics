@@ -1,5 +1,31 @@
 import Foundation
 
+/// What basis the denominator of a conversion rate was computed on.
+///
+/// Apple's dashboard denominator is **"Impressions (Unique Devices)"**,
+/// which *includes unique product page views* ("The number of unique
+/// devices that have viewed your app on the Today, Games, Apps, and
+/// Search tabs of the App Store. Includes unique product page views.").
+/// The App Store Discovery and Engagement report splits that universe
+/// into separate `Impression` and `Page view` events, and the per-device
+/// overlap between the two event types is not published — so a
+/// denominator derived from the report's impression events alone is
+/// narrower than Apple's, and its exact distance from Apple's value
+/// cannot be proven in either direction.
+public enum ASCImpressionBasis: Hashable, Codable, Sendable {
+    /// The caller asserts that the denominator equals Apple's dashboard
+    /// "Impressions (Unique Devices)" for the window — for example because
+    /// it was read from Apple's own dashboard export. The assertion is the
+    /// caller's responsibility; ASCAPIAnalytics cannot verify it.
+    case assertedDashboardUniqueDevices
+    /// The denominator was derived from Discovery-report Impression-event
+    /// unique counts only. This basis is provably narrower than Apple's
+    /// dashboard impressions whenever any product page view occurred, and
+    /// the overlap is unknowable — it can never produce a conversion rate
+    /// proven to match Apple's, so evaluation refuses it.
+    case discoveryReportImpressionEventsOnly
+}
+
 /// Result of a conversion rate evaluation.
 ///
 /// Apple's definition (Analytics metric definitions):
@@ -8,17 +34,20 @@ import Foundation
 /// It is not counted again when it downloads to their device."
 ///
 /// The package returns a number only when numerator and denominator are
-/// provably comparable; otherwise it reports why the value is unavailable
-/// or, on explicit request, marks an approximation as estimated. It never
-/// returns an unreliable percentage dressed up as exact.
+/// provably comparable **and** the denominator's basis is asserted to be
+/// Apple's dashboard basis; otherwise it reports why the value is
+/// unavailable or, on explicit request and only for the multi-day case,
+/// marks an approximation as estimated. It never returns an unreliable
+/// percentage dressed up as exact, and it never labels an approximation
+/// as a mathematically proven bound.
 public enum ASCConversionRateResult: Hashable, Codable, Sendable {
     /// Exactly recomputed for a single-day window with a single unique
-    /// impressions deduplication domain.
+    /// impressions deduplication domain and an asserted dashboard basis.
     case available(rate: Decimal, numerator: Int, denominator: Int)
-    /// An approximation, with the reason it is not exact. The denominator
-    /// of an estimated rate is an upper bound (daily unique counts summed
-    /// without cross-day deduplication), so the estimated rate is a lower
-    /// bound of Apple's own value.
+    /// An approximation, with the reason it is not exact. The note states
+    /// what was approximated; because the true dashboard value is not
+    /// reconstructable from published data, no mathematical bound
+    /// direction is claimed.
     case estimated(rate: Decimal, numerator: Int, denominator: Int, note: String)
     /// The metric is well defined but the inputs do not support computing
     /// it honestly.
@@ -44,9 +73,16 @@ public struct ASCConversionRateInputs: Hashable, Codable, Sendable {
     public let numeratorAppIdentifier: String
     /// Date range the numerator covers.
     public let numeratorWindow: ASCDateRange
-    /// Total downloads and pre-orders within `numeratorWindow` (Apple's
-    /// "Total Downloads" = first-time downloads + redownloads, plus
-    /// pre-order placements).
+    /// Total downloads **and pre-order placements** within
+    /// `numeratorWindow`, each counted exactly once.
+    ///
+    /// Apple counts a pre-order towards the conversion rate when it is
+    /// placed and "not counted again when it downloads to their device".
+    /// The App Downloads report's `Pre-Order` flag marks downloads that
+    /// came from a pre-order — those rows are already inside the download
+    /// counts and must **not** be added a second time. Pre-order
+    /// placements themselves live in the App Store Pre-orders report
+    /// ("placed, minus cancelations"), not in the downloads report.
     public let downloadsAndPreOrders: Int
 
     /// Apple identifier of the app the denominator counts impressions for.
@@ -59,6 +95,9 @@ public struct ASCConversionRateInputs: Hashable, Codable, Sendable {
     /// were aggregated over (1 means one date in one dimension
     /// combination).
     public let impressionsDeduplicationDomainCount: Int
+    /// What the denominator was computed on. Only an asserted dashboard
+    /// basis can produce an `available` result.
+    public let denominatorBasis: ASCImpressionBasis
 
     public init(
         numeratorAppIdentifier: String,
@@ -67,7 +106,8 @@ public struct ASCConversionRateInputs: Hashable, Codable, Sendable {
         denominatorAppIdentifier: String,
         denominatorWindow: ASCDateRange,
         uniqueDeviceImpressions: Int?,
-        impressionsDeduplicationDomainCount: Int
+        impressionsDeduplicationDomainCount: Int,
+        denominatorBasis: ASCImpressionBasis
     ) {
         self.numeratorAppIdentifier = numeratorAppIdentifier
         self.numeratorWindow = numeratorWindow
@@ -76,6 +116,7 @@ public struct ASCConversionRateInputs: Hashable, Codable, Sendable {
         self.denominatorWindow = denominatorWindow
         self.uniqueDeviceImpressions = uniqueDeviceImpressions
         self.impressionsDeduplicationDomainCount = impressionsDeduplicationDomainCount
+        self.denominatorBasis = denominatorBasis
     }
 }
 
@@ -84,6 +125,12 @@ public enum ASCConversionRateEvaluator {
     /// Attempts an exact evaluation.
     ///
     /// Rules enforced:
+    /// - The denominator basis must be asserted to be Apple's dashboard
+    ///   "Impressions (Unique Devices)". A denominator derived from
+    ///   Discovery-report impression events alone is refused: Apple's
+    ///   dashboard impressions include unique product page views, and the
+    ///   per-device overlap between impression and page-view events is
+    ///   not published.
     /// - Numerator and denominator must belong to the same app.
     /// - Numerator and denominator windows must be identical.
     /// - Exactness requires a single-day window: Apple deduplicates
@@ -97,6 +144,11 @@ public enum ASCConversionRateEvaluator {
     public static func evaluate(
         _ inputs: ASCConversionRateInputs
     ) -> ASCConversionRateResult {
+        guard inputs.denominatorBasis == .assertedDashboardUniqueDevices else {
+            return .unavailable(
+                reason: "the denominator is derived from Discovery-report impression events only; Apple's conversion-rate denominator is dashboard Impressions (Unique Devices), which include unique product page views — the per-device overlap between impression and page-view events is not published, so this basis cannot reproduce Apple's conversion rate"
+            )
+        }
         guard inputs.numeratorAppIdentifier == inputs.denominatorAppIdentifier else {
             return .unavailable(
                 reason: "numerator app (\(inputs.numeratorAppIdentifier)) and denominator app (\(inputs.denominatorAppIdentifier)) differ; the ratio would mix populations"
@@ -119,7 +171,7 @@ public enum ASCConversionRateEvaluator {
         }
         guard inputs.numeratorWindow.dayCount == 1 else {
             return .unavailable(
-                reason: "the window spans \(inputs.numeratorWindow.dayCount) days; unique devices are deduplicated per day, so a multi-day conversion rate cannot be reproduced exactly (use evaluateAllowingEstimate for a labeled lower bound)"
+                reason: "the window spans \(inputs.numeratorWindow.dayCount) days; unique devices are deduplicated per day, so a multi-day conversion rate cannot be reproduced exactly (use evaluateAllowingEstimate for a labeled approximation)"
             )
         }
         guard impressions > 0 else {
@@ -136,14 +188,17 @@ public enum ASCConversionRateEvaluator {
     }
 
     /// Attempts an evaluation, falling back to an explicitly labeled
-    /// estimate when exactness is impossible but a defensible approximation
-    /// exists: the denominator becomes the sum of per-day unique counts,
-    /// which double-counts devices across days and is therefore an upper
-    /// bound; the estimated rate is a lower bound of Apple's value.
+    /// approximation when exactness is impossible but the only obstacle is
+    /// the multi-day window: the denominator becomes the sum of per-day
+    /// unique counts, which double-counts devices across days. The note
+    /// states this without claiming a mathematical bound direction — the
+    /// true dashboard value is not reconstructable from published data, so
+    /// neither "lower bound" nor "upper bound" can be proven.
     ///
-    /// Only the multi-day case is estimable. Dimension splits, app
-    /// mismatches, and window mismatches remain `unavailable` even here —
-    /// there is no defensible approximation for those.
+    /// Only the multi-day case is estimable, and only on an asserted
+    /// dashboard basis. Dimension splits, app mismatches, window
+    /// mismatches, and report-derived impression bases remain
+    /// `unavailable` even here.
     public static func evaluateAllowingEstimate(
         _ inputs: ASCConversionRateInputs
     ) -> ASCConversionRateResult {
@@ -152,6 +207,9 @@ public enum ASCConversionRateEvaluator {
             return exact
         }
 
+        guard inputs.denominatorBasis == .assertedDashboardUniqueDevices else {
+            return exact
+        }
         guard inputs.numeratorAppIdentifier == inputs.denominatorAppIdentifier else {
             return exact
         }
@@ -174,7 +232,7 @@ public enum ASCConversionRateEvaluator {
             rate: rate,
             numerator: inputs.downloadsAndPreOrders,
             denominator: impressions,
-            note: "denominator sums \(days) days of per-day unique device impressions without cross-day deduplication; it is an upper bound, so this rate is a lower bound of Apple's conversion rate"
+            note: "denominator sums \(days) days of per-day unique device impressions without cross-day device deduplication; it is an approximation whose direction and magnitude relative to Apple's own conversion rate cannot be proven from published data"
         )
     }
 }

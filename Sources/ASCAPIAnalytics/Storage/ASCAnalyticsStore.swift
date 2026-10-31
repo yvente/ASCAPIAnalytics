@@ -3,9 +3,18 @@ import Foundation
 /// Identity of one ingested report file set, used for idempotent syncing
 /// and for supersession of corrected data.
 ///
-/// Lookup matches every non-nil field, so a key with only `instanceID`
-/// set finds an analytics ingestion regardless of its source kind, and a
-/// sales key pins vendor, report date, and version.
+/// For Sales and Trends the identity is the full tuple: vendor number,
+/// report type, report subtype, frequency (together in
+/// `salesReportKind`), report date, and the version. `reportVersion`
+/// participates in matching **exactly**: `nil` means "an import fetched as
+/// the latest available version, whose version number Apple does not echo
+/// back", and it only ever matches another `nil` — it is never a wildcard,
+/// so an unversioned latest import can never be conflated with an
+/// explicitly versioned one.
+///
+/// For Analytics the identity is the report instance id; a lookup key with
+/// only `instanceID` set finds an analytics ingestion regardless of its
+/// source kind (the kind is only known after parsing).
 public struct ASCIngestionKey: Hashable, Codable, Sendable {
     /// The report family.
     public let sourceKind: ASCReportSourceKind
@@ -13,9 +22,16 @@ public struct ASCIngestionKey: Hashable, Codable, Sendable {
     public let instanceID: String?
     /// Sales and Trends vendor number.
     public let vendorNumber: String?
+    /// Sales report kind — the composite `"TYPE/SUBTYPE/FREQUENCY"` that
+    /// distinguishes, for example, a daily Summary Sales report from a
+    /// weekly one for the same report date.
+    public let salesReportKind: String?
     /// Sales and Trends report date filter value.
     public let reportDate: String?
-    /// Sales and Trends report version.
+    /// Sales and Trends report version. An explicit string pins that
+    /// version; `nil` identifies an import fetched as "latest available"
+    /// whose version number is unknown. Matching is exact, never a
+    /// wildcard.
     public let reportVersion: String?
     /// Distinguishes a conflicting re-delivery of the same identity (same
     /// instance or report version, different content). The primary import
@@ -28,6 +44,7 @@ public struct ASCIngestionKey: Hashable, Codable, Sendable {
         sourceKind: ASCReportSourceKind,
         instanceID: String? = nil,
         vendorNumber: String? = nil,
+        salesReportKind: String? = nil,
         reportDate: String? = nil,
         reportVersion: String? = nil,
         deliveryID: String? = nil
@@ -35,6 +52,7 @@ public struct ASCIngestionKey: Hashable, Codable, Sendable {
         self.sourceKind = sourceKind
         self.instanceID = instanceID
         self.vendorNumber = vendorNumber
+        self.salesReportKind = salesReportKind
         self.reportDate = reportDate
         self.reportVersion = reportVersion
         self.deliveryID = deliveryID
@@ -46,6 +64,7 @@ public struct ASCIngestionKey: Hashable, Codable, Sendable {
             sourceKind: sourceKind,
             instanceID: instanceID,
             vendorNumber: vendorNumber,
+            salesReportKind: salesReportKind,
             reportDate: reportDate,
             reportVersion: reportVersion,
             deliveryID: deliveryID
@@ -235,8 +254,44 @@ public protocol ASCAnalyticsStoreTransaction: AnyObject, Sendable {
 ///   excluded without losing it.
 public protocol ASCAnalyticsStore: Sendable {
     /// Begins a transaction. Implementations may reject concurrent
-    /// transactions with `ASCAnalyticsError.storeInconsistentState`.
+    /// transactions with `ASCAnalyticsError.storeInconsistentState`, and
+    /// must release the slot when a transaction is committed, rolled
+    /// back, or dropped unfinished — a cancelled or abandoned transaction
+    /// must never block later syncs.
     func beginTransaction() async throws -> any ASCAnalyticsStoreTransaction
+
+    /// Queries committed sales records.
+    /// - Parameters:
+    ///   - appAppleIdentifiers: restrict to records attributed to these
+    ///     Apple identifiers (direct rows) — `nil` disables the filter.
+    ///   - parentIdentifiers: restrict to in-app purchase rows attributed
+    ///     to these parent identifiers — `nil` disables the filter.
+    ///     A record matches when either filter applies to it (OR across
+    ///     the two namespaces), so one app's direct sales and its
+    ///     in-app purchases are retrievable together.
+    ///   - range: restrict to records whose Begin Date intersects the
+    ///     range — `nil` disables the filter.
+    ///   - scope: which ingestion states to include.
+    func salesRecords(
+        appAppleIdentifiers: Set<String>?,
+        parentIdentifiers: Set<String>?,
+        in range: ASCDateRange?,
+        scope: ASCIngestionQueryScope
+    ) async throws -> [ASCProvenancedRecord<ASCSalesRecord>]
+
+    /// Queries stored download records.
+    func downloadRecords(
+        appIdentifiers: Set<String>?,
+        in range: ASCDateRange?,
+        scope: ASCIngestionQueryScope
+    ) async throws -> [ASCProvenancedRecord<ASCDownloadRecord>]
+
+    /// Queries stored discovery records.
+    func discoveryRecords(
+        appIdentifiers: Set<String>?,
+        in range: ASCDateRange?,
+        scope: ASCIngestionQueryScope
+    ) async throws -> [ASCProvenancedRecord<ASCDiscoveryRecord>]
 
     /// Runs `body` in a transaction: commits on success, rolls back and
     /// rethrows on failure. This is the recommended way to obtain atomic

@@ -69,7 +69,7 @@ public enum ASCMetricCatalog: CaseIterable, Sendable {
         case .productPageViewsUniqueDevices:
             return "Apple: 'The number of unique devices that have viewed your App Store product page.' (Discovery and Engagement report, Unique Counts, Event = Page view)"
         case .conversionRate:
-            return "Apple: 'Total downloads and pre-orders divided by unique device impressions. When a user pre-orders an app, it counts towards your conversion rate. It is not counted again when it downloads to their device.' Exactly reproducible only for single-day windows with a single unique-impressions deduplication domain; otherwise unavailable or explicitly estimated."
+            return "Apple: 'Total downloads and pre-orders divided by unique device impressions. When a user pre-orders an app, it counts towards your conversion rate. It is not counted again when it downloads to their device.' The denominator is Apple's dashboard Impressions (Unique Devices), which include unique product page views; the Discovery report splits impressions and page views into separate events whose per-device overlap is not published, so report-derived denominators are unavailable. A rate is returned only for single-day windows with a single deduplication domain and an explicitly asserted dashboard-basis denominator; otherwise unavailable or, for multi-day windows only, explicitly estimated without a claimed bound direction."
         case .salesUnits:
             return "Aggregated units from the Summary Sales report, split by product type. Negative values are refunds or CMB-C credits."
         case .grossSalesByCurrency:

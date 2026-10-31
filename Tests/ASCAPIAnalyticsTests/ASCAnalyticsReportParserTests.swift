@@ -55,7 +55,10 @@ final class ASCDownloadsReportParserTests: XCTestCase {
         XCTAssertEqual(metrics.preOrderCounts, 4)
         XCTAssertEqual(metrics.firstTimeDownloads, 12)
         XCTAssertEqual(metrics.appleTotalDownloads, 12)
-        XCTAssertEqual(metrics.downloadsAndPreOrders, 16)
+        // Pre-order-flagged rows are already inside the download buckets;
+        // the metrics expose no property that adds them twice (the old
+        // `downloadsAndPreOrders` double count was removed).
+        XCTAssertGreaterThan(metrics.preOrderCounts, 0)
     }
 
     func testExtraColumnsPreservedAndDetailColumnsTolerated() throws {

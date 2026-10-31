@@ -206,38 +206,46 @@ final class ASCAnalyticsAggregationTests: XCTestCase {
         }
     }
 
-    func testLatestProcessingDateSelectionOverwritesPerEventDate() {
-        func entry(
-            date: String, processingDate: String?, counts: Int
-        ) -> ASCProvenancedRecord<ASCDownloadRecord> {
-            let record = ASCDownloadRecord(
-                date: ASCCalendarDate(iso8601Day: date)!,
-                appAppleIdentifier: "1001",
-                rawDownloadType: "First-time Download",
-                downloadType: .firstTimeDownload,
-                territory: "US",
-                counts: counts,
-                isPreOrder: nil,
-                extraFields: [:]
-            )
-            let provenance = ASCReportProvenance(
-                sourceKind: .analyticsDownloads,
-                instanceID: "inst-\(processingDate ?? "none")",
-                processingDate: processingDate,
-                granularity: .daily,
-                schemaFingerprint: "fp",
-                contentChecksum: "cc-\(counts)",
-                fetchedAt: Date(),
-                recordCount: 1
-            )
-            return ASCProvenancedRecord(record: record, provenance: provenance)
-        }
+    private func selectionEntry(
+        app: String = "1001",
+        date: String,
+        processingDate: String?,
+        counts: Int,
+        reportID: String = "rep-1",
+        fingerprint: String = "fp",
+        granularity: ASCReportGranularity = .daily
+    ) -> ASCProvenancedRecord<ASCDownloadRecord> {
+        let record = ASCDownloadRecord(
+            date: ASCCalendarDate(iso8601Day: date)!,
+            appAppleIdentifier: app,
+            rawDownloadType: "First-time Download",
+            downloadType: .firstTimeDownload,
+            territory: "US",
+            counts: counts,
+            isPreOrder: nil,
+            extraFields: [:]
+        )
+        let provenance = ASCReportProvenance(
+            sourceKind: .analyticsDownloads,
+            reportName: "app-download",
+            reportID: reportID,
+            instanceID: "inst-\(processingDate ?? "none")-\(counts)",
+            processingDate: processingDate,
+            granularity: granularity,
+            schemaFingerprint: fingerprint,
+            contentChecksum: "cc-\(counts)",
+            fetchedAt: Date(),
+            recordCount: 1
+        )
+        return ASCProvenancedRecord(record: record, provenance: provenance)
+    }
 
+    func testLatestProcessingDateSelectionOverwritesPerEventDate() {
         // Apple: "Don't merge records for a Date across two report
         // instances to avoid double counting. Use the latest instance."
-        let early = entry(date: "2025-10-01", processingDate: "2024-04-01", counts: 100)
-        let late = entry(date: "2025-10-01", processingDate: "2024-04-02", counts: 120)
-        let otherDay = entry(date: "2025-10-02", processingDate: "2024-04-01", counts: 50)
+        let early = selectionEntry(date: "2025-10-01", processingDate: "2024-04-01", counts: 100)
+        let late = selectionEntry(date: "2025-10-01", processingDate: "2024-04-02", counts: 120)
+        let otherDay = selectionEntry(date: "2025-10-02", processingDate: "2024-04-01", counts: 50)
 
         let selected = ASCInstanceSelection.latestProcessingDatePerEventDate([early, late, otherDay])
         XCTAssertEqual(selected.count, 2)
@@ -247,7 +255,7 @@ final class ASCAnalyticsAggregationTests: XCTestCase {
 
         // Records without a processing date lose against dated instances
         // but survive when nothing dated covers the day.
-        let undated = entry(date: "2025-10-01", processingDate: nil, counts: 999)
+        let undated = selectionEntry(date: "2025-10-01", processingDate: nil, counts: 999)
         let withUndated = ASCInstanceSelection.latestProcessingDatePerEventDate([undated, late])
         XCTAssertEqual(withUndated.count, 1)
         XCTAssertEqual(withUndated[0].record.counts, 120)
@@ -255,5 +263,137 @@ final class ASCAnalyticsAggregationTests: XCTestCase {
         let onlyUndated = ASCInstanceSelection.latestProcessingDatePerEventDate([undated])
         XCTAssertEqual(onlyUndated.count, 1)
         XCTAssertEqual(onlyUndated[0].record.counts, 999)
+    }
+
+    func testSelectionNeverOverwritesAcrossApps() {
+        // Same event date, same report, different apps: one app's later
+        // correction must not overwrite the other app's data.
+        let app1Early = selectionEntry(app: "1001", date: "2025-10-01", processingDate: "2024-04-01", counts: 10)
+        let app1Late = selectionEntry(app: "1001", date: "2025-10-01", processingDate: "2024-04-02", counts: 12)
+        let app2Early = selectionEntry(app: "2002", date: "2025-10-01", processingDate: "2024-04-01", counts: 30)
+        let app2Late = selectionEntry(app: "2002", date: "2025-10-01", processingDate: "2024-04-05", counts: 33)
+
+        let selected = ASCInstanceSelection.latestProcessingDatePerEventDate(
+            [app1Early, app1Late, app2Early, app2Late]
+        )
+        XCTAssertEqual(selected.count, 2)
+        XCTAssertTrue(selected.contains { $0.record.appAppleIdentifier == "1001" && $0.record.counts == 12 })
+        XCTAssertTrue(selected.contains { $0.record.appAppleIdentifier == "2002" && $0.record.counts == 33 })
+        XCTAssertFalse(selected.contains { $0.record.counts == 10 })
+        XCTAssertFalse(selected.contains { $0.record.counts == 30 })
+    }
+
+    func testSelectionNeverOverwritesAcrossStandardAndDetailedVariants() {
+        // Standard and detailed report variants describe the same events
+        // with different schemas; a detailed correction must not overwrite
+        // the standard data (callers pick one variant to aggregate).
+        let standardEarly = selectionEntry(
+            date: "2025-10-01", processingDate: "2024-04-01", counts: 10,
+            fingerprint: "standard-header"
+        )
+        let standardLate = selectionEntry(
+            date: "2025-10-01", processingDate: "2024-04-03", counts: 11,
+            fingerprint: "standard-header"
+        )
+        let detailedEarly = selectionEntry(
+            date: "2025-10-01", processingDate: "2024-04-01", counts: 10,
+            reportID: "rep-1", fingerprint: "detailed-header"
+        )
+        let detailedLate = selectionEntry(
+            date: "2025-10-01", processingDate: "2024-04-02", counts: 12,
+            reportID: "rep-1", fingerprint: "detailed-header"
+        )
+
+        let selected = ASCInstanceSelection.latestProcessingDatePerEventDate(
+            [standardEarly, standardLate, detailedEarly, detailedLate]
+        )
+        XCTAssertEqual(selected.count, 2, "each variant keeps its own latest instance")
+        XCTAssertTrue(selected.contains { $0.provenance.schemaFingerprint == "standard-header" && $0.record.counts == 11 })
+        XCTAssertTrue(selected.contains { $0.provenance.schemaFingerprint == "detailed-header" && $0.record.counts == 12 })
+    }
+
+    func testSelectionNeverOverwritesAcrossGranularities() {
+        // Daily and weekly instances may share an anchor Date value; they
+        // are different deduplication scopes.
+        let dailyEarly = selectionEntry(
+            date: "2025-09-30", processingDate: "2024-04-01", counts: 5,
+            granularity: .daily
+        )
+        let dailyLate = selectionEntry(
+            date: "2025-09-30", processingDate: "2024-04-02", counts: 6,
+            granularity: .daily
+        )
+        let weekly = selectionEntry(
+            date: "2025-09-30", processingDate: "2024-04-05", counts: 42,
+            granularity: .weekly
+        )
+
+        let selected = ASCInstanceSelection.latestProcessingDatePerEventDate(
+            [dailyEarly, dailyLate, weekly]
+        )
+        XCTAssertEqual(selected.count, 2)
+        XCTAssertTrue(selected.contains { $0.provenance.granularity == .daily && $0.record.counts == 6 })
+        XCTAssertTrue(selected.contains { $0.provenance.granularity == .weekly && $0.record.counts == 42 })
+    }
+
+    func testSelectionNeverOverwritesAcrossReports() {
+        // Two different reports (distinct report ids) with identical
+        // schemas: corrections of one never overwrite the other.
+        let reportA = selectionEntry(
+            date: "2025-10-01", processingDate: "2024-04-01", counts: 7,
+            reportID: "rep-A", fingerprint: "same-header"
+        )
+        let reportB = selectionEntry(
+            date: "2025-10-01", processingDate: "2024-04-02", counts: 8,
+            reportID: "rep-B", fingerprint: "same-header"
+        )
+        let selected = ASCInstanceSelection.latestProcessingDatePerEventDate([reportA, reportB])
+        XCTAssertEqual(selected.count, 2)
+    }
+
+    func testEffectiveStoreQueriesApplySelectionPerGroup() async throws {
+        let store = ASCInMemoryAnalyticsStore()
+        let key = ASCIngestionKey(sourceKind: .analyticsDownloads, instanceID: "unused")
+
+        func ingest(_ entry: ASCProvenancedRecord<ASCDownloadRecord>) async throws {
+            try await store.withTransaction { transaction in
+                try await transaction.insertDownloads([entry], ingestionKey: ASCIngestionKey(
+                    sourceKind: .analyticsDownloads,
+                    instanceID: entry.provenance.instanceID
+                ))
+                try await transaction.upsertIngestion(ASCIngestionEntry(
+                    key: ASCIngestionKey(
+                        sourceKind: .analyticsDownloads,
+                        instanceID: entry.provenance.instanceID
+                    ),
+                    state: .imported,
+                    processingDate: entry.provenance.processingDate,
+                    granularity: entry.provenance.granularity,
+                    schemaFingerprint: entry.provenance.schemaFingerprint,
+                    contentChecksum: entry.provenance.contentChecksum,
+                    recordCount: 1,
+                    importedAt: Date()
+                ))
+            }
+        }
+
+        // Two apps, two processing dates each, plus a weekly record.
+        try await ingest(selectionEntry(app: "1001", date: "2025-10-01", processingDate: "2024-04-01", counts: 10))
+        try await ingest(selectionEntry(app: "1001", date: "2025-10-01", processingDate: "2024-04-02", counts: 12))
+        try await ingest(selectionEntry(app: "2002", date: "2025-10-01", processingDate: "2024-04-01", counts: 30))
+        try await ingest(selectionEntry(app: "2002", date: "2025-10-01", processingDate: "2024-04-05", counts: 33))
+        try await ingest(selectionEntry(app: "2002", date: "2025-10-01", processingDate: "2024-04-06", counts: 99, granularity: .weekly))
+        _ = key
+
+        let effective = try await store.effectiveDownloadRecords()
+        XCTAssertEqual(effective.count, 3, "latest per (app, report, variant, granularity, date)")
+        XCTAssertTrue(effective.contains { $0.record.appAppleIdentifier == "1001" && $0.record.counts == 12 })
+        XCTAssertTrue(effective.contains { $0.record.appAppleIdentifier == "2002" && $0.record.counts == 33 })
+        XCTAssertTrue(effective.contains { $0.record.counts == 99 })
+
+        // The per-app query path works too.
+        let app1 = try await store.effectiveDownloadRecords(appIdentifiers: ["1001"])
+        XCTAssertEqual(app1.count, 1)
+        XCTAssertEqual(app1[0].record.counts, 12)
     }
 }

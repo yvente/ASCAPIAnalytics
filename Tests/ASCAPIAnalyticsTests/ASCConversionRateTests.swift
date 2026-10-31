@@ -11,7 +11,8 @@ final class ASCConversionRateTests: XCTestCase {
         impressions: Int? = 100,
         domains: Int = 1,
         numeratorApp: String = "1234567890",
-        denominatorApp: String = "1234567890"
+        denominatorApp: String = "1234567890",
+        basis: ASCImpressionBasis = .assertedDashboardUniqueDevices
     ) -> ASCConversionRateInputs {
         ASCConversionRateInputs(
             numeratorAppIdentifier: numeratorApp,
@@ -20,11 +21,12 @@ final class ASCConversionRateTests: XCTestCase {
             denominatorAppIdentifier: denominatorApp,
             denominatorWindow: denominatorWindow ?? window,
             uniqueDeviceImpressions: impressions,
-            impressionsDeduplicationDomainCount: domains
+            impressionsDeduplicationDomainCount: domains,
+            denominatorBasis: basis
         )
     }
 
-    func testExactSingleDaySingleDomain() {
+    func testExactSingleDaySingleDomainWithAssertedBasis() {
         let result = ASCConversionRateEvaluator.evaluate(inputs())
         XCTAssertEqual(
             result,
@@ -33,6 +35,20 @@ final class ASCConversionRateTests: XCTestCase {
             )
         )
         XCTAssertEqual(result.ratePercent, Decimal(string: "12"))
+    }
+
+    func testDiscoveryReportBasisIsRefusedEvenWhenEverythingElseHolds() {
+        // A single day, a single domain, correct app and window — the rate
+        // is still refused because the denominator comes from the
+        // Discovery report's impression events, which are narrower than
+        // Apple's dashboard Impressions (they include unique product page
+        // views) by an unknowable amount.
+        let result = ASCConversionRateEvaluator.evaluate(inputs(basis: .discoveryReportImpressionEventsOnly))
+        guard case .unavailable(let reason) = result else {
+            return XCTFail("expected unavailable, got \(result)")
+        }
+        XCTAssertTrue(reason.contains("impression events"), reason)
+        XCTAssertTrue(reason.contains("product page views"), reason)
     }
 
     func testWindowMismatchIsUnavailable() {
@@ -85,7 +101,7 @@ final class ASCConversionRateTests: XCTestCase {
         XCTAssertTrue(reason.contains("7 days"), reason)
     }
 
-    func testMultiDayEstimateIsExplicitlyLabeled() {
+    func testMultiDayEstimateIsExplicitlyLabeledWithoutBoundClaim() {
         let window = ASCDateRange(
             start: ASCCalendarDate(iso8601Day: "2025-10-01")!,
             end: ASCCalendarDate(iso8601Day: "2025-10-07")!
@@ -99,8 +115,12 @@ final class ASCConversionRateTests: XCTestCase {
         XCTAssertEqual(rate, Decimal(string: "0.01")!)
         XCTAssertEqual(numerator, 7)
         XCTAssertEqual(denominator, 700)
-        XCTAssertTrue(note.contains("upper bound"), note)
-        XCTAssertTrue(note.contains("7 days"), note)
+        // The note must describe the approximation without claiming a
+        // provable mathematical bound direction.
+        XCTAssertTrue(note.contains("cross-day"), note)
+        XCTAssertTrue(note.contains("cannot be proven"), note)
+        XCTAssertFalse(note.lowercased().contains("lower bound"), note)
+        XCTAssertFalse(note.lowercased().contains("upper bound"), note)
     }
 
     func testEstimateRefusedForDimensionSplits() {
@@ -116,9 +136,21 @@ final class ASCConversionRateTests: XCTestCase {
             end: ASCCalendarDate(iso8601Day: "2025-10-07")!
         )!
         let result = ASCConversionRateEvaluator.evaluateAllowingEstimate(
-            inputs(window: window, denominatorWindow: .singleDay(ASCCalendarDate(iso8601Day: "2025-10-01")!))
+            inputs(window: window, denominatorWindow: ASCDateRange.singleDay(ASCCalendarDate(iso8601Day: "2025-10-01")!))
         )
         guard case .unavailable = result else { return XCTFail("got \(result)") }
+    }
+
+    func testEstimateRefusedForReportDerivedBasis() {
+        let window = ASCDateRange(
+            start: ASCCalendarDate(iso8601Day: "2025-10-01")!,
+            end: ASCCalendarDate(iso8601Day: "2025-10-07")!
+        )!
+        let result = ASCConversionRateEvaluator.evaluateAllowingEstimate(
+            inputs(window: window, basis: .discoveryReportImpressionEventsOnly)
+        )
+        guard case .unavailable(let reason) = result else { return XCTFail("got \(result)") }
+        XCTAssertTrue(reason.contains("impression events"), reason)
     }
 
     func testDownloadToPaidFamilyIsUnsupported() {
@@ -131,36 +163,58 @@ final class ASCConversionRateTests: XCTestCase {
         }
     }
 
-    func testConversionRateViaAggregator() throws {
-        // Single day, single impression row: exactly computable.
+    // MARK: - Aggregator
+
+    func testAggregatorRefusesReportDerivedDenominatorWithPageViewEvents() throws {
         let downloads = try ASCDownloadsReportParser().parse(ASCFixtures.downloadsReport([
             ASCFixtures.downloadsLine(date: "2025-10-01", downloadType: "First-time Download", counts: "10"),
             ASCFixtures.downloadsLine(date: "2025-10-01", downloadType: "Redownload", counts: "2"),
-            ASCFixtures.downloadsLine(date: "2025-10-01", downloadType: "Auto-update", counts: "100"),
         ]))
         let discovery = try ASCDiscoveryReportParser().parse(ASCFixtures.discoveryReport([
             ASCFixtures.discoveryLine(date: "2025-10-01", event: "Impression", counts: "200", uniqueCounts: "150"),
+            ASCFixtures.discoveryLine(date: "2025-10-01", event: "Page view", counts: "80", uniqueCounts: "60"),
         ]))
 
         let aggregator = ASCAnalyticsAggregator()
         let window = ASCDateRange.singleDay(ASCCalendarDate(iso8601Day: "2025-10-01")!)
-        let filter = ASCAnalyticsFilter(dateRange: window)
         let result = aggregator.conversionRate(
             downloads: downloads.records,
             impressions: discovery.records,
-            filter: filter
+            filter: ASCAnalyticsFilter(dateRange: window)
         )
-        // Numerator: first-time (10) + redownload (2); auto-updates are
-        // excluded by Apple's Total Downloads definition.
-        XCTAssertEqual(
-            result,
-            ASCConversionRateResult.available(
-                rate: Decimal(string: "0.08")!, numerator: 12, denominator: 150
-            )
-        )
+        guard case .unavailable(let reason) = result else {
+            return XCTFail("expected unavailable, got \(result)")
+        }
+        // Basis failure: dashboard impressions include page views; the
+        // two event types cannot be deduplicated into one device set.
+        XCTAssertTrue(reason.contains("page view events"), reason)
     }
 
-    func testConversionRateViaAggregatorRefusedWithoutDateRange() throws {
+    func testAggregatorRefusesImpressionOnlyDenominator() throws {
+        // Even with no page-view rows in the filtered set, the
+        // impression-event denominator is narrower than Apple's dashboard
+        // basis by an unknowable amount.
+        let downloads = try ASCDownloadsReportParser().parse(ASCFixtures.downloadsReport([
+            ASCFixtures.downloadsLine(date: "2025-10-01", downloadType: "First-time Download", counts: "10"),
+        ]))
+        let discovery = try ASCDiscoveryReportParser().parse(ASCFixtures.discoveryReport([
+            ASCFixtures.discoveryLine(date: "2025-10-01", event: "Impression", counts: "200", uniqueCounts: "150"),
+        ]))
+        let aggregator = ASCAnalyticsAggregator()
+        let result = aggregator.conversionRate(
+            downloads: downloads.records,
+            impressions: discovery.records,
+            filter: ASCAnalyticsFilter(
+                dateRange: ASCDateRange.singleDay(ASCCalendarDate(iso8601Day: "2025-10-01")!)
+            )
+        )
+        guard case .unavailable(let reason) = result else {
+            return XCTFail("expected unavailable, got \(result)")
+        }
+        XCTAssertTrue(reason.contains("narrower than Apple's basis"), reason)
+    }
+
+    func testAggregatorRefusesWithoutDateRange() throws {
         let downloads = try ASCDownloadsReportParser().parse(ASCFixtures.downloadsReport([
             ASCFixtures.downloadsLine(date: "2025-10-01", downloadType: "First-time Download", counts: "10"),
         ]))
@@ -174,11 +228,64 @@ final class ASCConversionRateTests: XCTestCase {
         guard case .unavailable = result else { return XCTFail("got \(result)") }
     }
 
-    func testMetricCatalogDocumentsCorrectionOfConversionRateDefinition() {
+    // MARK: - Pre-order semantics
+
+    func testPreOrderFlaggedRowsAreNotDoubleCountedAsPreOrderPlacements() throws {
+        // Apple: pre-orders count towards the conversion rate when
+        // PLACED and "not counted again when it downloads". The downloads
+        // report's Pre-Order flag marks downloads that came from a
+        // pre-order — they are already inside the download-type buckets.
+        // The metrics deliberately expose no property that adds them a
+        // second time.
+        let records = try ASCDownloadsReportParser().parse(ASCFixtures.downloadsReport([
+            ASCFixtures.downloadsLine(
+                date: "2025-10-01", downloadType: "First-time Download",
+                counts: "4", preOrder: "true"
+            ),
+            ASCFixtures.downloadsLine(
+                date: "2025-10-01", downloadType: "First-time Download",
+                counts: "6", preOrder: "false"
+            ),
+        ])).records
+        let metrics = ASCDownloadMetrics(records: records)
+        XCTAssertEqual(metrics.firstTimeDownloads, 10)
+        XCTAssertEqual(metrics.preOrderCounts, 4)
+        XCTAssertEqual(metrics.appleTotalDownloads, 10)
+    }
+
+    func testCrossEventUniqueCountsAreNeverSummed() throws {
+        // Impression and Page view are different events; their unique
+        // device sets overlap in ways Apple does not publish. Each event
+        // keeps its own per-domain unique counts and no API combines the
+        // two event types into one device set.
+        let records = try ASCDiscoveryReportParser().parse(ASCFixtures.discoveryReport([
+            ASCFixtures.discoveryLine(date: "2025-10-01", event: "Impression", counts: "200", uniqueCounts: "150"),
+            ASCFixtures.discoveryLine(date: "2025-10-01", event: "Page view", counts: "80", uniqueCounts: "60"),
+        ])).records
+        let metrics = ASCDiscoveryMetrics(records: records)
+        XCTAssertEqual(metrics.impressionCounts, 200)
+        XCTAssertEqual(metrics.pageViewCounts, 80)
+        // Both events' unique counts are retained separately, keyed by
+        // their own deduplication domains.
+        XCTAssertEqual(metrics.uniqueCountEntries.count, 2)
+        let events = Set(metrics.uniqueCountEntries.map(\.rawEvent))
+        XCTAssertEqual(events, ["Impression", "Page view"])
+        // The impression-event unique count (150) is a NARROWER basis than
+        // Apple's dashboard impressions; the conversion rate helper must
+        // refuse it (covered in the aggregator tests below). Nothing in
+        // the metrics offers a combined impression+page-view unique total.
+        XCTAssertEqual(metrics.combinedUniqueImpressionCounts, ASCSupportStatus.supported,
+                       "the impression event's own single-domain value stays available")
+        XCTAssertEqual(metrics.combinedUniquePageViewCounts, ASCSupportStatus.supported,
+                       "the page view event's own single-domain value stays available")
+    }
+
+    func testMetricCatalogDocumentsCorrectedConversionRateDefinition() {
         // The catalog pins the corrected definition: downloads and
         // pre-orders over unique device impressions — NOT downloads over
-        // product page views.
+        // product page views — and names the dashboard-basis caveat.
         XCTAssertTrue(ASCMetricCatalog.conversionRate.definition.contains("unique device impressions"))
+        XCTAssertTrue(ASCMetricCatalog.conversionRate.definition.contains("include unique product page views"))
         XCTAssertFalse(ASCMetricCatalog.conversionRate.definition.contains("product page views divided"))
     }
 }

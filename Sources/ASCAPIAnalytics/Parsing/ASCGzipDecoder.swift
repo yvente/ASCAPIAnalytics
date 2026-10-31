@@ -114,7 +114,11 @@ public struct ASCGzipDecoder: Sendable {
         var memberCount = 0
 
         while offset < data.count {
-            guard data[data.startIndex + offset] == 0x1F,
+            // Bounds-check before reading the two magic bytes: trailing
+            // input shorter than a magic sequence (for example a lone
+            // 0x1F byte) is trailing data, never an out-of-range index.
+            guard offset + 1 < data.count,
+                  data[data.startIndex + offset] == 0x1F,
                   data[data.startIndex + offset + 1] == 0x8B
             else {
                 throw ASCAnalyticsError.gzipTrailingData(offset: offset)

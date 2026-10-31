@@ -42,10 +42,14 @@ reporting data — the reporting companion to
   never summed across currencies.
 - **Conversion rate** (`ASCConversionRateEvaluator`): Apple's definition —
   total downloads and pre-orders divided by unique device impressions.
-  Exactly computable only for single-day windows with a single unique
-  impressions deduplication domain; otherwise `unavailable`, or
-  `estimated` with an explicit lower-bound note on request. D1/D7/D35
-  download-to-paid and retention cohorts are **unsupported** by design.
+  Apple's dashboard denominator includes unique product page views, which
+  the Discovery report splits into separate events whose device overlap is
+  unpublished; a rate is therefore returned only for single-day windows
+  with a single deduplication domain **and an explicitly asserted
+  dashboard-basis denominator**, otherwise `unavailable` (or, for
+  multi-day windows only, `estimated` without a claimed bound direction).
+  D1/D7/D35 download-to-paid and retention cohorts are **unsupported** by
+  design.
 - **Aggregation** (`ASCSalesAggregator`, `ASCAnalyticsAggregator`):
   filtering by date/app/territory/currency, per-day and per-territory
   breakdowns, and Apple's documented overwrite rule for report instances
@@ -68,14 +72,24 @@ reporting data — the reporting companion to
 - **D1/D7/D35 download-to-paid** and **retention cohorts**: Apple's public
   reports do not publish cohort-level data; the package refuses to
   approximate them.
-- **Multi-day conversion rates**: unique device impressions are deduplicated
-  per day by Apple, so exact multi-day rates cannot be recomputed from
-  published exports; the evaluator returns `unavailable` or an explicitly
-  labeled lower-bound `estimated` value.
+- **Conversion-rate denominators derived from the Discovery report**:
+  Apple's dashboard denominator ("Impressions (Unique Devices)") includes
+  unique product page views, which the report records as separate events
+  whose per-device overlap is unpublished; report-derived denominators are
+  always refused, and a rate requires an explicitly asserted dashboard
+  basis.
+- **Multi-day conversion rates**: unique devices are deduplicated per
+  day, so multi-day rates cannot be recomputed exactly; on an asserted
+  dashboard basis the evaluator returns an `estimated` value whose note
+  claims no bound direction.
+- **Pre-order placements**: the downloads report's `Pre-Order` flag marks
+  downloads that came from a pre-order (already inside the download
+  counts); pre-order placements minus cancellations live in the Pre-orders
+  report, which is not consumed yet.
 - **Apple's own dashboard numbers**: metrics here are recomputed from
   published report files; where a report basis differs from a dashboard
-  metric (for example Pre-Orders minus cancellations), that is documented
-  in `docs/METRIC_DEFINITIONS.md` rather than hidden.
+  metric, that is documented in `docs/METRIC_DEFINITIONS.md` rather than
+  hidden.
 - Weekly/monthly Analytics instances and the remaining Analytics report
   families (usage, performance, commerce) parse only through the generic
   machinery; their dedicated models and metrics are future work.

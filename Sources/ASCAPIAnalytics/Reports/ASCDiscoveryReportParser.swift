@@ -237,6 +237,6 @@ public struct ASCDiscoveryReportParser: Sendable {
     )
 }
 
-extension ASCDiscoveryRecord: ASCEventDated {
+extension ASCDiscoveryRecord: ASCEventDated, ASCAnalyticsEventRecord {
     public var eventDate: ASCCalendarDate { date }
 }

@@ -387,3 +387,39 @@ public struct ASCSalesReportParser: Sendable {
 extension ASCSalesRecord: ASCEventDated {
     public var eventDate: ASCCalendarDate { beginDate }
 }
+
+extension ASCSalesAppAttribution {
+    /// Unified attribution matching shared by `ASCSalesFilter` and store
+    /// queries.
+    ///
+    /// A record matches when its direct `Apple Identifier` is in
+    /// `appAppleIdentifiers` (direct rows: apps, bundles, updates,
+    /// re-downloads) **or** its `Parent Identifier` SKU is in
+    /// `parentIdentifiers` (in-app purchase rows). `nil` sets impose no
+    /// constraint of that kind. This OR semantics lets one query retrieve
+    /// an app's direct sales together with its in-app purchases — the two
+    /// identity fields are different namespaces and never exclude each
+    /// other.
+    public func matches(
+        appAppleIdentifiers: Set<String>?,
+        parentIdentifiers: Set<String>?
+    ) -> Bool {
+        var clauses: [Bool] = []
+        if appAppleIdentifiers != nil {
+            if case .appleIdentifier(let id) = self {
+                clauses.append(appAppleIdentifiers!.contains(id))
+            } else {
+                clauses.append(false)
+            }
+        }
+        if parentIdentifiers != nil {
+            if case .parentIdentifierSKU(let sku) = self {
+                clauses.append(parentIdentifiers!.contains(sku))
+            } else {
+                clauses.append(false)
+            }
+        }
+        if clauses.isEmpty { return true }
+        return clauses.contains(true)
+    }
+}

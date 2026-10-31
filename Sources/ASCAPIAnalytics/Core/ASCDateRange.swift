@@ -234,6 +234,14 @@ public protocol ASCEventDated {
     var eventDate: ASCCalendarDate { get }
 }
 
+/// Analytics report records that also carry the app they describe.
+/// `ASCInstanceSelection` needs the app identifier so that one app's
+/// correction can never overwrite another app's data.
+public protocol ASCAnalyticsEventRecord: ASCEventDated {
+    /// The `App Apple Identifier` of the record.
+    var appAppleIdentifier: String { get }
+}
+
 /// A parsed record together with the provenance of the report file it came
 /// from. Storage persists these; aggregation reads them.
 public struct ASCProvenancedRecord<Record>:

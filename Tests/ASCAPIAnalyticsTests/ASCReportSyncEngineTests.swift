@@ -177,17 +177,24 @@ final class ASCReportSyncEngineTests: XCTestCase {
     }
 
     func testCorruptSegmentAbortsInstanceWithoutCommit() async throws {
+        // A segment that matches a supported header but contains garbage
+        // values is a real parse failure: the instance fails and nothing
+        // is committed. (Foreign headers are skipped as unsupported by
+        // default — see the dedicated tests.)
         scriptAnalytics(
             instances: [downloadsInstance(id: "i1", processingDate: "2025-10-02")],
             segmentPayloads: [
-                ("i1", Data("This is not a report".utf8)),
+                ("i1", ASCFixtures.downloadsReport([
+                    ASCFixtures.downloadsLine(date: "not-a-date", downloadType: "First-time Download", counts: "1"),
+                ])),
             ]
         )
         let result = try await sync()
         XCTAssertFalse(result.succeeded)
-        guard case .failed = result.outcomes[0].outcome else {
+        guard case .failed(let reason) = result.outcomes[0].outcome else {
             return XCTFail("expected failed, got \(result.outcomes[0].outcome)")
         }
+        XCTAssertTrue(reason.contains("failed to parse"), reason)
         let records = try await store.downloadRecords()
         XCTAssertEqual(records.count, 0, "a failed parse must leave the store untouched")
     }
@@ -271,7 +278,7 @@ final class ASCReportSyncEngineTests: XCTestCase {
         XCTAssertEqual(metrics.impressionCounts, 100)
     }
 
-    func testUnknownReportHeaderFailsTheInstance() async throws {
+    func testUnknownReportHeaderIsSkippedWithDiagnosticsByDefault() async throws {
         scriptAnalytics(
             instances: [downloadsInstance(id: "i1", processingDate: "2025-10-02")],
             segmentPayloads: [
@@ -279,6 +286,28 @@ final class ASCReportSyncEngineTests: XCTestCase {
             ]
         )
         let result = try await sync()
+        XCTAssertTrue(result.succeeded, "an unsupported report must not fail the default run")
+        XCTAssertEqual(result.skippedUnsupportedCount, 1)
+        guard case .skippedUnsupported(let reason) = result.outcomes[0].outcome else {
+            return XCTFail("expected skippedUnsupported, got \(result.outcomes[0].outcome)")
+        }
+        XCTAssertTrue(reason.contains("neither the App Downloads"), reason)
+        let records = try await store.downloadRecords()
+        XCTAssertEqual(records.count, 0, "unsupported reports must never be counted")
+    }
+
+    func testUnknownReportHeaderFailsInStrictMode() async throws {
+        scriptAnalytics(
+            instances: [downloadsInstance(id: "i1", processingDate: "2025-10-02")],
+            segmentPayloads: [
+                ("i1", ASCFixtures.tsv(["Some\tOther\tReport", "a\tb\tc"])),
+            ]
+        )
+        let result = try await engine.syncAnalytics(
+            ASCAnalyticsSyncConfiguration(appID: appID, failsOnUnsupportedReports: true),
+            store: store
+        )
+        XCTAssertFalse(result.succeeded)
         guard case .failed(let reason) = result.outcomes[0].outcome else {
             return XCTFail("expected failed, got \(result.outcomes[0].outcome)")
         }
@@ -393,6 +422,350 @@ final class ASCReportSyncEngineTests: XCTestCase {
         XCTAssertEqual(records.count, 2)
         let units = Set(records.map(\.record.units))
         XCTAssertEqual(units, [5, 7])
+    }
+
+    // MARK: - Segment identity and checksum strategy
+
+    func testSegmentsWithoutDeclaredChecksumsRevalidateByContent() async throws {
+        // Apple declares no checksums: the declared-checksum shortcut must
+        // never fire; idempotency falls back to verified content.
+        scriptAnalytics(
+            instances: [downloadsInstance(id: "i1", processingDate: "2025-10-02")],
+            segmentPayloads: [("i1", downloadsPayload(date: "2025-10-01", firstTime: 10))]
+        )
+        provider.listAnalyticsReportSegmentsHandler = { _ in
+            [ASCAnalyticsReportSegment(
+                id: "seg-i1",
+                attributes: .init(checksum: nil, sizeInBytes: nil, url: "https://example.com/i1")
+            )]
+        }
+        let first = try await sync()
+        XCTAssertEqual(first.importedCount, 1)
+
+        // Same content again: content compare recognizes it.
+        let second = try await sync()
+        XCTAssertEqual(second.outcomes.first?.outcome, .skippedAlreadyImported)
+        let records = try await store.downloadRecords()
+        XCTAssertEqual(records.count, 2, "no double counting")
+
+        // Content changes (still no declared checksums): quarantined, and
+        // the originally imported data keeps counting.
+        provider.downloadAnalyticsReportSegmentHandler = { _ in
+            ASCFixtures.downloadsReport([
+                ASCFixtures.downloadsLine(date: "2025-10-01", downloadType: "First-time Download", counts: "555"),
+            ])
+        }
+        let third = try await sync()
+        guard case .pendingReview = third.outcomes[0].outcome else {
+            return XCTFail("expected pendingReview, got \(third.outcomes[0].outcome)")
+        }
+        let current = try await store.downloadRecords(scope: .current)
+        XCTAssertEqual(current.count, 2)
+        XCTAssertEqual(current.map(\.record.counts).max(), 10)
+    }
+
+    func testEmptyDeclaredChecksumsAreNeverTreatedAsUnchanged() async throws {
+        // An empty string is "no checksum". Two deliveries with empty
+        // declared checksums but different content must never be
+        // collapsed into a skip.
+        scriptAnalytics(
+            instances: [downloadsInstance(id: "i1", processingDate: "2025-10-02")],
+            segmentPayloads: [("i1", downloadsPayload(date: "2025-10-01", firstTime: 10))]
+        )
+        provider.listAnalyticsReportSegmentsHandler = { _ in
+            [ASCAnalyticsReportSegment(
+                id: "seg-i1",
+                attributes: .init(checksum: "", sizeInBytes: nil, url: "https://example.com/i1")
+            )]
+        }
+        _ = try await sync()
+        provider.downloadAnalyticsReportSegmentHandler = { _ in
+            ASCFixtures.downloadsReport([
+                ASCFixtures.downloadsLine(date: "2025-10-01", downloadType: "First-time Download", counts: "777"),
+            ])
+        }
+        let second = try await sync()
+        guard case .pendingReview = second.outcomes[0].outcome else {
+            return XCTFail("expected pendingReview, got \(second.outcomes[0].outcome)")
+        }
+    }
+
+    func testSameContentInDifferentSegmentIDsIsKeptTwice() async throws {
+        // Segments are partitions identified by their segment id: two
+        // different ids with byte-identical content are both kept —
+        // dropping one by content would silently discard a partition.
+        let payload = downloadsPayload(date: "2025-10-01", firstTime: 5)
+        let instance = downloadsInstance(id: "i1", processingDate: "2025-10-02")
+        scriptAnalytics(
+            instances: [instance],
+            segmentPayloads: [("a", payload)]
+        )
+        provider.listAnalyticsReportSegmentsHandler = { _ in
+            [
+                ASCAnalyticsReportSegment(id: "seg-a", attributes: .init(checksum: "x", sizeInBytes: nil, url: "https://example.com/a")),
+                ASCAnalyticsReportSegment(id: "seg-b", attributes: .init(checksum: "x", sizeInBytes: nil, url: "https://example.com/b")),
+            ]
+        }
+        provider.downloadAnalyticsReportSegmentHandler = { _ in payload }
+
+        let result = try await sync()
+        XCTAssertTrue(result.succeeded)
+        let records = try await store.downloadRecords()
+        XCTAssertEqual(records.count, 4, "both segments parsed: 2 rows each")
+        XCTAssertEqual(Set(records.map { $0.provenance.segmentID ?? "" }), ["seg-a", "seg-b"])
+    }
+
+    func testDuplicateSegmentIDIsParsedOnce() async throws {
+        // The same segment id listed twice: one download, one parse, no
+        // double counting.
+        let payload = downloadsPayload(date: "2025-10-01", firstTime: 5)
+        scriptAnalytics(
+            instances: [downloadsInstance(id: "i1", processingDate: "2025-10-02")],
+            segmentPayloads: [("i1", payload)]
+        )
+        provider.listAnalyticsReportSegmentsHandler = { _ in
+            [
+                ASCAnalyticsReportSegment(id: "seg-i1", attributes: .init(checksum: "x", sizeInBytes: nil, url: "https://example.com/1")),
+                ASCAnalyticsReportSegment(id: "seg-i1", attributes: .init(checksum: "x", sizeInBytes: nil, url: "https://example.com/2")),
+            ]
+        }
+        let downloadCounter = DownloadCounter()
+        provider.downloadAnalyticsReportSegmentHandler = { _ in
+            downloadCounter.increment()
+            return payload
+        }
+
+        let result = try await sync()
+        XCTAssertTrue(result.succeeded)
+        XCTAssertEqual(downloadCounter.count, 1, "same segment id must be downloaded once")
+        let records = try await store.downloadRecords()
+        XCTAssertEqual(records.count, 2, "parsed once: 2 rows, not 4")
+    }
+
+    func testPartialSegmentFailureRollsBackWholeInstance() async throws {
+        // Two segments; the second fails to download. Nothing from the
+        // instance may be committed.
+        let instance = downloadsInstance(id: "i1", processingDate: "2025-10-02")
+        scriptAnalytics(
+            instances: [instance],
+            segmentPayloads: [("a", downloadsPayload(date: "2025-10-01", firstTime: 5))]
+        )
+        provider.listAnalyticsReportSegmentsHandler = { _ in
+            [
+                ASCAnalyticsReportSegment(id: "seg-a", attributes: .init(checksum: nil, sizeInBytes: nil, url: "https://example.com/a")),
+                ASCAnalyticsReportSegment(id: "seg-b", attributes: .init(checksum: nil, sizeInBytes: nil, url: "https://example.com/b")),
+            ]
+        }
+        provider.downloadAnalyticsReportSegmentHandler = { [weak self] segment in
+            if segment.id == "seg-b" {
+                throw ASCAnalyticsError.providerInvalidData(reason: "download interrupted (stub)")
+            }
+            return self?.downloadsPayload(date: "2025-10-01", firstTime: 5) ?? Data()
+        }
+
+        let result = try await sync()
+        XCTAssertFalse(result.succeeded)
+        guard case .failed = result.outcomes[0].outcome else {
+            return XCTFail("expected failed, got \(result.outcomes[0].outcome)")
+        }
+        let records = try await store.downloadRecords()
+        XCTAssertEqual(records.count, 0, "partial writes must never survive")
+        let entries = try await store.beginTransaction().ingestionEntries(state: nil)
+        XCTAssertEqual(entries.count, 0)
+    }
+
+    func testNegativeMaximumInstancesPerReportDoesNotCrash() async throws {
+        scriptAnalytics(
+            instances: [downloadsInstance(id: "i1", processingDate: "2025-10-02")],
+            segmentPayloads: [("i1", downloadsPayload(date: "2025-10-01", firstTime: 1))]
+        )
+        // A nonsensical limit selects no instances instead of crashing in
+        // `prefix`.
+        for limit in [-1, 0] {
+            let result = try await engine.syncAnalytics(
+                ASCAnalyticsSyncConfiguration(appID: appID, maximumInstancesPerReport: limit),
+                store: store
+            )
+            XCTAssertEqual(result.outcomes.count, 0)
+            let records = try await store.downloadRecords()
+            XCTAssertEqual(records.count, 0)
+        }
+        // A sane run still works afterwards on the same store.
+        let result = try await sync()
+        XCTAssertEqual(result.importedCount, 1)
+    }
+
+    // MARK: - Sales identity
+
+    private func syncSalesVersion(
+        reportDate: String, version: String?, payload: Data,
+        frequency: ASCSalesReportFrequency = .daily
+    ) async throws -> ASCSalesSyncOutcome {
+        provider.downloadSalesReportHandler = { _ in payload }
+        let result = try await engine.syncSales(
+            ASCSalesSyncConfiguration(
+                vendorNumber: "80000",
+                frequency: frequency,
+                reportDates: [reportDate],
+                versions: [version]
+            ),
+            store: store
+        )
+        return result.outcomes[0]
+    }
+
+    func testDefaultVersionRepeatSyncIsIdempotent() async throws {
+        let payload = salesPayload(units: "5", price: "0.99")
+        let first = try await syncSalesVersion(reportDate: "2025-10-01", version: nil, payload: payload)
+        guard case .imported = first.outcome else {
+            return XCTFail("expected imported, got \(first.outcome)")
+        }
+        let second = try await syncSalesVersion(reportDate: "2025-10-01", version: nil, payload: payload)
+        XCTAssertEqual(second.outcome, .skippedAlreadyImported)
+        let records = try await store.salesRecords()
+        XCTAssertEqual(records.count, 1)
+    }
+
+    func testExplicitVersionsCoexistInLedgerWithSupersession() async throws {
+        let v1 = salesPayload(units: "5", price: "0.99")
+        let v2 = salesPayload(units: "3", price: "0.99")
+        _ = try await syncSalesVersion(reportDate: "2025-10-01", version: "1", payload: v1)
+        let second = try await syncSalesVersion(reportDate: "2025-10-01", version: "2", payload: v2)
+
+        XCTAssertTrue(second.outcome.isSuccessfulImport)
+        XCTAssertEqual(second.supersededVersions, ["1"], "explicit numeric correction overrides the older version")
+
+        let current = try await store.salesRecords()
+        XCTAssertEqual(current.count, 1)
+        XCTAssertEqual(current[0].record.units, 3)
+        let audit = try await store.salesRecords(scope: .all)
+        XCTAssertEqual(audit.count, 2, "both versions retained for audit")
+    }
+
+    func testUnversionedLatestConflictingContentRequiresManualResolution() async throws {
+        // First an explicit import, then an unversioned latest download
+        // with different content: replacement semantics cannot be proven,
+        // so the outcome must demand manual review — never a silent
+        // replace, never a double count, never "same version".
+        _ = try await syncSalesVersion(reportDate: "2025-10-01", version: "1", payload: salesPayload(units: "5", price: "0.99"))
+        let latest = try await syncSalesVersion(reportDate: "2025-10-01", version: nil, payload: salesPayload(units: "9", price: "0.99"))
+
+        guard case .pendingReview(let reason) = latest.outcome else {
+            return XCTFail("expected pendingReview, got \(latest.outcome)")
+        }
+        XCTAssertTrue(reason.contains("manual review"), reason)
+
+        // Old statistics are still the counted ones, but the conflict is
+        // visible and retained.
+        let current = try await store.salesRecords()
+        XCTAssertEqual(current.count, 1)
+        XCTAssertEqual(current[0].record.units, 5)
+        let audit = try await store.salesRecords(scope: .all)
+        XCTAssertEqual(audit.count, 2)
+        let pending = try await store.beginTransaction().ingestionEntries(state: .pendingReview)
+        XCTAssertEqual(pending.count, 1)
+    }
+
+    func testUnversionedLatestMatchingImportedContentIsSkipped() async throws {
+        // The unversioned latest download returns content byte-identical
+        // to an already imported explicit version: recognized by content.
+        let payload = salesPayload(units: "5", price: "0.99")
+        _ = try await syncSalesVersion(reportDate: "2025-10-01", version: "1", payload: payload)
+        let latest = try await syncSalesVersion(reportDate: "2025-10-01", version: nil, payload: payload)
+        XCTAssertEqual(latest.outcome, .skippedAlreadyImported)
+        let records = try await store.salesRecords()
+        XCTAssertEqual(records.count, 1)
+    }
+
+    func testExplicitVersionAfterUnversionedImportRequiresManualResolution() async throws {
+        // An unversioned (latest) import exists with different content; an
+        // explicit version cannot be ordered against it (older? newer?),
+        // so the delivery is quarantined for manual review instead of
+        // guessing which content is current.
+        _ = try await syncSalesVersion(reportDate: "2025-10-01", version: nil, payload: salesPayload(units: "5", price: "0.99"))
+        let explicit = try await syncSalesVersion(reportDate: "2025-10-01", version: "1", payload: salesPayload(units: "7", price: "0.99"))
+
+        guard case .pendingReview(let reason) = explicit.outcome else {
+            return XCTFail("expected pendingReview, got \(explicit.outcome)")
+        }
+        XCTAssertTrue(reason.contains("manual review"), reason)
+        XCTAssertTrue(explicit.supersededVersions.isEmpty)
+
+        // The unversioned import keeps counting; the conflict is retained.
+        let current = try await store.salesRecords()
+        XCTAssertEqual(current.count, 1)
+        XCTAssertEqual(current[0].record.units, 5)
+        let audit = try await store.salesRecords(scope: .all)
+        XCTAssertEqual(audit.count, 2)
+        let pending = try await store.beginTransaction().ingestionEntries(state: .pendingReview)
+        XCTAssertEqual(pending.count, 1)
+    }
+
+    func testExplicitVersionIdentifyingAlreadyImportedContentSupersedesUnversionedEntry() async throws {
+        // The unversioned latest download returned some content; a later
+        // explicit version download returns byte-identical content: the
+        // version identifies what we already have. The unversioned entry
+        // is superseded, and exactly one counted copy remains.
+        let payload = salesPayload(units: "5", price: "0.99")
+        _ = try await syncSalesVersion(reportDate: "2025-10-01", version: nil, payload: payload)
+        let identified = try await syncSalesVersion(reportDate: "2025-10-01", version: "1", payload: payload)
+
+        XCTAssertTrue(identified.outcome.isSuccessfulImport)
+        XCTAssertEqual(identified.supersededVersions, ["latest(unversioned)"])
+        let current = try await store.salesRecords()
+        XCTAssertEqual(current.count, 1, "same content: no double counting")
+        let audit = try await store.salesRecords(scope: .all)
+        XCTAssertEqual(audit.count, 2)
+    }
+
+    func testDifferentFrequencySameDateAreDistinctIdentities() async throws {
+        let daily = try await syncSalesVersion(
+            reportDate: "2025-10-01", version: nil,
+            payload: salesPayload(units: "5", price: "0.99"),
+            frequency: .daily
+        )
+        let weekly = try await syncSalesVersion(
+            reportDate: "2025-10-01", version: nil,
+            payload: salesPayload(units: "30", price: "0.99"),
+            frequency: .weekly
+        )
+        guard case .imported = daily.outcome else { return XCTFail("daily: \(daily.outcome)") }
+        guard case .imported = weekly.outcome else {
+            // The weekly content differs from the daily import; because
+            // the identities are distinct, the weekly import is a fresh
+            // import of its own identity — not a conflict.
+            return XCTFail("weekly: \(weekly.outcome)")
+        }
+        let audit = try await store.salesRecords(scope: .all)
+        XCTAssertEqual(audit.count, 2)
+        let units = Set(audit.map(\.record.units))
+        XCTAssertEqual(units, [5, 30])
+        // And their identities differ in the kind component.
+        let kinds = Set(audit.map { $0.provenance.sourceKind })
+        XCTAssertEqual(kinds, [.summarySales])
+    }
+
+    func testSalesIdentityIncludesKindAcrossFrequencies() async throws {
+        // The weekly report for the same date must not match the daily
+        // report's ledger entry on repeat syncs.
+        _ = try await syncSalesVersion(
+            reportDate: "2025-10-01", version: nil,
+            payload: salesPayload(units: "5", price: "0.99"),
+            frequency: .daily
+        )
+        _ = try await syncSalesVersion(
+            reportDate: "2025-10-01", version: nil,
+            payload: salesPayload(units: "5", price: "0.99"),
+            frequency: .daily
+        )
+        let weekly = try await syncSalesVersion(
+            reportDate: "2025-10-01", version: nil,
+            payload: salesPayload(units: "5", price: "0.99"),
+            frequency: .weekly
+        )
+        guard case .imported = weekly.outcome else {
+            return XCTFail("weekly with identical content must be its own import, got \(weekly.outcome)")
+        }
     }
 
     // MARK: - Offline guarantees

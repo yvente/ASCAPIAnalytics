@@ -5,7 +5,7 @@ import XCTest
 @testable import ASCAPIAnalytics
 
 /// Little-endian bytes of a fixed-width integer.
-private func LE<T: FixedWidthInteger>(_ value: T) -> Data {
+func LE<T: FixedWidthInteger>(_ value: T) -> Data {
     var littleEndianValue = value.littleEndian
     return Data(bytes: &littleEndianValue, count: MemoryLayout<T>.size)
 }
@@ -270,5 +270,26 @@ func assertThrowsASCError<T>(
             return
         }
         verifier(ascError)
+    }
+}
+
+
+/// Thread-safe counter for stub download assertions.
+final class DownloadCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage = 0
+    var count: Int {
+        lock.withLock { storage }
+    }
+    func increment() {
+        lock.withLock { storage += 1 }
+    }
+}
+
+extension ASCSalesSyncOutcome.ReportOutcome {
+    /// Convenience for tests: whether the outcome was an import.
+    var isSuccessfulImport: Bool {
+        if case .imported = self { return true }
+        return false
     }
 }

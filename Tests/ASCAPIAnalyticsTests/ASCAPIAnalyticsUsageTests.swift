@@ -109,12 +109,36 @@ final class ASCAPIAnalyticsUsageTests: XCTestCase {
             ASCFixtures.discoveryLine(date: "2025-10-01", event: "Impression", counts: "200", uniqueCounts: "150"),
         ])).records
 
-        let rate = ASCAnalyticsAggregator().conversionRate(
+        // A denominator derived from the Discovery report cannot be proven
+        // to match Apple's dashboard impressions basis (which includes
+        // unique product page views), so the report-based helper refuses.
+        let reportBasedRate = ASCAnalyticsAggregator().conversionRate(
             downloads: downloadRecords,
             impressions: discoveryRecords,
             filter: ASCAnalyticsFilter(
                 appIdentifiers: ["1234567890"],
                 dateRange: ASCDateRange.singleDay(ASCCalendarDate(iso8601Day: "2025-10-01")!)
+            )
+        )
+        guard case .unavailable = reportBasedRate else {
+            return XCTFail("expected unavailable, got \(reportBasedRate)")
+        }
+
+        // With a denominator asserted to be Apple's dashboard basis (for
+        // example read from the dashboard itself), the evaluator computes
+        // the exact single-day rate: numerator = first-time (10) +
+        // redownload (2); auto-updates are excluded by Apple's Total
+        // Downloads definition.
+        let rate = ASCConversionRateEvaluator.evaluate(
+            ASCConversionRateInputs(
+                numeratorAppIdentifier: "1234567890",
+                numeratorWindow: ASCDateRange.singleDay(ASCCalendarDate(iso8601Day: "2025-10-01")!),
+                downloadsAndPreOrders: 12,
+                denominatorAppIdentifier: "1234567890",
+                denominatorWindow: ASCDateRange.singleDay(ASCCalendarDate(iso8601Day: "2025-10-01")!),
+                uniqueDeviceImpressions: 150,
+                impressionsDeduplicationDomainCount: 1,
+                denominatorBasis: .assertedDashboardUniqueDevices
             )
         )
         XCTAssertEqual(

@@ -72,6 +72,12 @@ Core columns: **Date**, **App Name**, **App Apple Identifier**,
 **Source Type**, **Source Info**, **Campaign**, **Page Type**,
 **Page Title**, **Pre-Order**, **Territory**, **Counts**.
 
+The `Pre-Order` flag marks downloads that **came from a pre-order** —
+those rows are already inside their download-type buckets. It is not a
+count of independent pre-order placements (Apple's Pre-Orders metric,
+"placed, minus cancelations", lives in the App Store Pre-orders report);
+the flag must never be added on top of download totals.
+
 Download Type glossary (case-insensitive match, unknown values preserved):
 
 | Value | Meaning |

@@ -132,7 +132,9 @@ final class ASCInMemoryStoreTests: XCTestCase {
     }
 
     func testConcurrentTransactionIsRejected() async throws {
-        _ = try await store.beginTransaction()
+        // Hold the transaction: the slot is occupied only while the
+        // transaction object is alive and unfinished.
+        let active = try await store.beginTransaction()
         do {
             _ = try await store.beginTransaction()
             XCTFail("expected concurrent transaction rejection")
@@ -141,6 +143,22 @@ final class ASCInMemoryStoreTests: XCTestCase {
                 return XCTFail("expected storeInconsistentState, got \(error)")
             }
         }
+        try await active.rollback()
+    }
+
+    func testDroppedTransactionReleasesSlotForLaterSyncs() async throws {
+        // Simulates cancellation: a transaction is begun and then simply
+        // dropped without commit or rollback. The slot must be released
+        // when the object deallocates — later syncs must never see a
+        // permanent "another transaction is already active".
+        do {
+            _ = try await store.beginTransaction()
+        }
+        // `tx` went out of scope above.
+        let next = try await store.beginTransaction()
+        try await next.rollback()
+
+        try await store.withTransaction { _ in }
     }
 
     func testSupersededRecordsExcludedByDefaultIncludedInAuditScope() async throws {
@@ -201,6 +219,82 @@ final class ASCInMemoryStoreTests: XCTestCase {
         XCTAssertEqual(current.count, 0, "pending-review data must never be counted")
         let all = try await store.salesRecords(scope: .all)
         XCTAssertEqual(all.count, 1, "pending-review data is retained for review")
+    }
+
+    func testPaidAppAndItsIAPRetrievableTogetherWithoutCrossAppLeakage() async throws {
+        // One paid app's direct sales plus its own IAP must be retrievable
+        // with a single query naming both identities — and another app's
+        // IAP must never leak in.
+        func record(app: String, parent: String?, productType: String, units: Decimal) -> ASCSalesRecord {
+            ASCSalesRecord(
+                beginDate: ASCCalendarDate(iso8601Day: "2025-10-01")!,
+                endDate: ASCCalendarDate(iso8601Day: "2025-10-01")!,
+                appleIdentifier: app,
+                sku: productType == "1F" ? "APP-\(app)" : "IAP-\(app)",
+                parentIdentifier: parent,
+                rawProductType: productType,
+                productType: ASCSalesProductType.classify(productType),
+                units: units,
+                customerPrice: 0.99,
+                customerCurrency: "USD",
+                developerProceeds: 0.70,
+                proceedsCurrency: "USD",
+                countryCode: "US",
+                cmb: .none,
+                extraFields: [:]
+            )
+        }
+
+        let paidAppRow = record(app: "1001", parent: nil, productType: "1F", units: 10)
+        let ownIAPRow = record(app: "8888", parent: "com.example.app", productType: "IA1", units: 4)
+        let otherIAPRow = record(app: "9999", parent: "com.other.app", productType: "IA1", units: 7)
+
+        let key = makeKey(version: "1")
+        try await store.withTransaction { transaction in
+            try await transaction.insertSales(
+                [paidAppRow, ownIAPRow, otherIAPRow].map {
+                    ASCProvenancedRecord(record: $0, provenance: self.makeProvenance(checksum: "a"))
+                },
+                ingestionKey: key
+            )
+            try await transaction.upsertIngestion(ASCIngestionEntry(
+                key: key, state: .imported,
+                schemaFingerprint: "fp", contentChecksum: "a",
+                recordCount: 3, importedAt: Date()
+            ))
+        }
+
+        // Store query with both identity sets: direct sales + own IAP.
+        let together = try await store.salesRecords(
+            appAppleIdentifiers: ["1001"],
+            parentIdentifiers: ["com.example.app"]
+        )
+        XCTAssertEqual(together.count, 2)
+        XCTAssertEqual(Set(together.map(\.record.units)), [10, 4])
+        XCTAssertFalse(together.contains { $0.record.units == 7 }, "the other app's IAP must not leak")
+
+        // The same semantics through ASCSalesFilter.
+        let filtered = ASCSalesFilter(
+            appAppleIdentifiers: ["1001"],
+            parentIdentifiers: ["com.example.app"]
+        ).apply([paidAppRow, ownIAPRow, otherIAPRow])
+        XCTAssertEqual(filtered.count, 2)
+
+        // Parent SKU alone: only the matching IAP row.
+        let parentsOnly = try await store.salesRecords(parentIdentifiers: ["com.example.app"])
+        XCTAssertEqual(parentsOnly.count, 1)
+        XCTAssertEqual(parentsOnly[0].record.units, 4)
+
+        // Apple identifier alone: only the direct row (IAP rows live in
+        // the parent-SKU namespace).
+        let directOnly = try await store.salesRecords(appAppleIdentifiers: ["1001"])
+        XCTAssertEqual(directOnly.count, 1)
+        XCTAssertEqual(directOnly[0].record.units, 10)
+
+        // The other app's IAP stays isolated.
+        let otherOnly = try await store.salesRecords(parentIdentifiers: ["com.other.app"])
+        XCTAssertEqual(otherOnly.count, 1)
+        XCTAssertEqual(otherOnly[0].record.units, 7)
     }
 
     func testDateAndAppQueries() async throws {

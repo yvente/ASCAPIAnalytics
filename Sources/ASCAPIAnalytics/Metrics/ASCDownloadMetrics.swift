@@ -30,10 +30,15 @@ public struct ASCDownloadMetrics: Hashable, Codable, Sendable {
     /// Counts of download types not in Apple's published glossary,
     /// preserved by raw value and sorted by it.
     public let otherDownloadTypeCounts: [ASCOtherDownloadTypeCounts]
-    /// Σ counts of rows whose `Pre-Order` flag is true. Apple's own
-    /// Pre-Orders metric subtracts cancellations, which the downloads
-    /// report does not expose; treat as exact only while no cancellations
-    /// occurred (see docs/METRIC_DEFINITIONS.md).
+    /// Σ counts of rows whose `Pre-Order` flag is true.
+    ///
+    /// This flag means the *download came from a pre-order* — those rows
+    /// are already inside their download-type buckets above and are NOT
+    /// independent pre-order placements. Apple's Pre-Orders metric ("the
+    /// total number of pre-orders placed, minus cancelations") is not
+    /// computable from the downloads report; placements live in the App
+    /// Store Pre-orders report. Never add `preOrderCounts` on top of
+    /// `appleTotalDownloads` — that would double count.
     public let preOrderCounts: Int
 
     /// Number of records contributing.
@@ -43,13 +48,6 @@ public struct ASCDownloadMetrics: Hashable, Codable, Sendable {
     /// Redownloads.
     public var appleTotalDownloads: Int {
         firstTimeDownloads + redownloads
-    }
-
-    /// Numerator basis of Apple's conversion rate: total downloads and
-    /// pre-orders, using the downloads report's pre-order rows as the
-    /// pre-order placement counts.
-    public var downloadsAndPreOrders: Int {
-        appleTotalDownloads + preOrderCounts
     }
 
     /// Σ of every count bucket, including unknown download types.
