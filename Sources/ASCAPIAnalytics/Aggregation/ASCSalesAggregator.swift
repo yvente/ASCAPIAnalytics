@@ -1,0 +1,209 @@
+import Foundation
+
+/// Filter applied to Summary Sales records before aggregation.
+///
+/// Date filtering uses the record's Begin Date (Apple's transaction window
+/// start). App filtering is split into two explicit key sets because the
+/// two attribution namespaces must never be mixed: direct rows are keyed
+/// by `Apple Identifier`, in-app purchase rows by `Parent Identifier`
+/// (Apple: the SKU of the associated app).
+public struct ASCSalesFilter: Hashable, Codable, Sendable {
+    /// Keeps records whose Begin Date falls inside the range.
+    public var dateRange: ASCDateRange?
+    /// Keeps direct rows (apps, bundles, updates, re-downloads) whose
+    /// `Apple Identifier` is in the set. `nil` disables the filter.
+    public var appAppleIdentifiers: Set<String>?
+    /// Keeps in-app purchase rows whose `Parent Identifier` is in the set.
+    /// `nil` disables the filter.
+    public var parentIdentifiers: Set<String>?
+    /// Keeps records whose `Country Code` is in the set. `nil` disables
+    /// the filter.
+    public var territories: Set<String>?
+    /// Keeps records whose `Customer Currency` is in the set
+    /// (case-insensitive). `nil` disables the filter.
+    public var customerCurrencies: Set<String>?
+    /// Keeps records whose classified product type is in the set.
+    /// `nil` disables the filter.
+    public var productTypes: Set<ASCSalesProductType>?
+
+    public init(
+        dateRange: ASCDateRange? = nil,
+        appAppleIdentifiers: Set<String>? = nil,
+        parentIdentifiers: Set<String>? = nil,
+        territories: Set<String>? = nil,
+        customerCurrencies: Set<String>? = nil,
+        productTypes: Set<ASCSalesProductType>? = nil
+    ) {
+        self.dateRange = dateRange
+        self.appAppleIdentifiers = appAppleIdentifiers
+        self.parentIdentifiers = parentIdentifiers
+        self.territories = territories
+        self.customerCurrencies = customerCurrencies
+        self.productTypes = productTypes
+    }
+
+    /// Whether the record passes the filter.
+    public func matches(_ record: ASCSalesRecord) -> Bool {
+        if let range = dateRange, !range.contains(record.beginDate) {
+            return false
+        }
+        guard record.appAttribution.matches(
+            appAppleIdentifiers: appAppleIdentifiers,
+            parentIdentifiers: parentIdentifiers
+        ) else {
+            return false
+        }
+        if let territories, !territories.contains(record.countryCode) {
+            return false
+        }
+        if let customerCurrencies {
+            let normalized = Set(customerCurrencies.map { $0.uppercased() })
+            if !normalized.contains(record.customerCurrency.uppercased()) {
+                return false
+            }
+        }
+        if let productTypes, !productTypes.contains(record.productType) {
+            return false
+        }
+        return true
+    }
+
+    /// Applies the filter to records.
+    public func apply(_ records: [ASCSalesRecord]) -> [ASCSalesRecord] {
+        records.filter { matches($0) }
+    }
+}
+
+/// Metrics grouped by report day (Begin Date).
+public struct ASCSalesDaySummary: Hashable, Codable, Sendable {
+    public let date: ASCCalendarDate
+    public let metrics: ASCSalesMetrics
+}
+
+/// The key an app group was formed on.
+public enum ASCSalesAppKey: Hashable, Codable, Sendable {
+    /// Grouped by the row's `Apple Identifier` (apps, bundles, updates,
+    /// re-downloads).
+    case appleIdentifier(String)
+    /// Grouped by `Parent Identifier` (Apple: the SKU of the associated
+    /// app) for in-app purchase rows.
+    case parentSKU(String)
+    /// Rows that could not be attributed.
+    case unattributed
+}
+
+/// Metrics grouped by app attribution.
+public struct ASCSalesAppSummary: Hashable, Codable, Sendable {
+    public let key: ASCSalesAppKey
+    public let metrics: ASCSalesMetrics
+}
+
+/// Account-level aggregation of Summary Sales records.
+///
+/// Totals, per-day, and per-app views all respect the currency rules:
+/// amounts are bucketed per currency, and no cross-currency total exists.
+public struct ASCSalesSummary: Hashable, Codable, Sendable {
+    /// The filter that produced this summary.
+    public let filter: ASCSalesFilter
+    /// Metrics over all filtered records.
+    public let totals: ASCSalesMetrics
+    /// Per-day breakdown (by Begin Date), sorted by date.
+    public let byDay: [ASCSalesDaySummary]
+    /// Per-app breakdown by attribution key, sorted by key.
+    public let byApp: [ASCSalesAppSummary]
+}
+
+/// Aggregates Summary Sales records under the package's currency and
+/// additivity rules.
+public struct ASCSalesAggregator: Sendable {
+    public init() {}
+
+    /// Aggregates records that pass `filter`.
+    public func summary(
+        _ records: [ASCSalesRecord], filter: ASCSalesFilter = ASCSalesFilter()
+    ) -> ASCSalesSummary {
+        let filtered = filter.apply(records)
+
+        let totals = ASCSalesMetrics(records: filtered)
+
+        var byDate: [ASCCalendarDate: [ASCSalesRecord]] = [:]
+        var byApp: [ASCSalesAppKey: [ASCSalesRecord]] = [:]
+        for record in filtered {
+            byDate[record.beginDate, default: []].append(record)
+            switch record.appAttribution {
+            case .appleIdentifier(let id):
+                byApp[.appleIdentifier(id), default: []].append(record)
+            case .parentIdentifierSKU(let sku):
+                byApp[.parentSKU(sku), default: []].append(record)
+            case .unattributed:
+                byApp[.unattributed, default: []].append(record)
+            }
+        }
+
+        let byDay = byDate
+            .map { ASCSalesDaySummary(date: $0.key, metrics: ASCSalesMetrics(records: $0.value)) }
+            .sorted { $0.date < $1.date }
+
+        let appSummaries = byApp
+            .map { ASCSalesAppSummary(key: $0.key, metrics: ASCSalesMetrics(records: $0.value)) }
+            .sorted { lhs, rhs in
+                switch (lhs.key, rhs.key) {
+                case (.appleIdentifier(let a), .appleIdentifier(let b)): return a < b
+                case (.parentSKU(let a), .parentSKU(let b)): return a < b
+                case (.appleIdentifier, _): return true
+                case (_, .appleIdentifier): return false
+                case (.parentSKU, _): return true
+                case (_, .parentSKU): return false
+                case (.unattributed, .unattributed): return false
+                }
+            }
+
+        return ASCSalesSummary(
+            filter: filter,
+            totals: totals,
+            byDay: byDay,
+            byApp: appSummaries
+        )
+    }
+
+    /// Aggregates sales records that carry provenance, with **report
+    /// frequency isolation**: daily, weekly, and monthly reports of the
+    /// same dates describe different periods and must never be summed
+    /// implicitly.
+    ///
+    /// - Parameters:
+    ///   - records: provenance-carrying sales records (for example from
+    ///     `ASCAnalyticsStore.salesRecords`).
+    ///   - salesReportKinds: when set, only records of these kinds
+    ///     (`"TYPE/SUBTYPE/FREQUENCY"`, as stored in
+    ///     `ASCReportProvenance.salesReportKind`) are aggregated.
+    ///   - filter: the usual record filter.
+    ///
+    /// When the remaining records span more than one report kind and no
+    /// kind selection was made, this throws
+    /// `ASCAnalyticsError.ambiguousMetricScope` rather than producing a
+    /// total that looks correct but double counts overlapping periods.
+    public func summary(
+        _ records: [ASCProvenancedRecord<ASCSalesRecord>],
+        salesReportKinds: Set<String>? = nil,
+        filter: ASCSalesFilter = ASCSalesFilter()
+    ) throws -> ASCSalesSummary {
+        var scoped = records
+        if let salesReportKinds {
+            scoped = scoped.filter { entry in
+                entry.provenance.salesReportKind.map { salesReportKinds.contains($0) } ?? false
+            }
+        }
+        let filtered = scoped.filter { filter.matches($0.record) }
+
+        let kinds = Set(filtered.map { $0.provenance.salesReportKind ?? "unspecified" })
+        guard kinds.count <= 1 else {
+            let described = kinds.sorted().joined(separator: ", ")
+            throw ASCAnalyticsError.ambiguousMetricScope(
+                reason: "the sales records span \(kinds.count) report kinds (\(described)); daily, weekly, and monthly reports cover different periods of the same dates and summing them would double count — select one kind via salesReportKinds or aggregate each kind separately"
+            )
+        }
+
+        return summary(filtered.map(\.record), filter: filter)
+    }
+}

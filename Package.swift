@@ -29,6 +29,13 @@ let package = Package(
                 .product(name: "ASCAPIKit", package: "ASCAPIKit")
             ]
         ),
+        .executableTarget(
+            name: "ASCAnalyticsVerify",
+            dependencies: [
+                "ASCAPIAnalytics"
+            ],
+            path: "Sources/ASCAnalyticsVerify"
+        ),
         .testTarget(
             name: "ASCAPIAnalyticsTests",
             dependencies: [
