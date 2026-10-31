@@ -117,6 +117,21 @@ Reconciliation rules — deliberately narrow:
   file, the parsed values agree with your expected figures. It does **not**
   mean the package reproduces every App Store Connect dashboard metric.
 
+## Real-report verification log
+
+- **2026-10-31** — A real Apple **Daily Summary Sales** report
+  (`S_D_*.txt.gz`, 64 data rows, single day 2026-10-28, 16 customer
+  currencies, 24 territories) was verified locally with the release CLI:
+  gzip and TSV parsing **PASS**, all **64/64 rows parsed successfully**,
+  no unknown product types, no unknown schema columns. The verification
+  surfaced one real-data compatibility finding: Apple leaves
+  **Currency of Proceeds blank on zero-price, zero-proceeds rows**
+  (free downloads/updates) — the parser now accepts that
+  (as `nil`, never a fabricated currency) and rejects a missing
+  proceeds currency only on monetary rows. This brings Summary Sales to
+  **LEVEL 3 — REAL_REPORT_PARSED**. No same-basis dashboard figures were
+  available, so LEVEL 4 was **not** attempted.
+
 ## Verification levels
 
 See [VALIDATION_MATRIX.md](VALIDATION_MATRIX.md). In short:

@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (real-report compatibility)
+
+- **Blank Currency of Proceeds on zero-value rows**: a real Apple Daily
+  Summary Sales report (2026-10-28) showed Apple leaves Currency of
+  Proceeds **blank on zero-price, zero-proceeds rows** (free downloads
+  and updates — 22 of 64 rows). `ASCSalesRecord.proceedsCurrency` is now
+  `String?`; the parser accepts a blank value **only** when both Customer
+  Price and Developer Proceeds are zero (a monetary row without a
+  proceeds currency remains a hard error), never fabricates a currency,
+  and still requires the column in the header. Such rows contribute to
+  units and product-type breakdowns, are counted in
+  `ASCSalesMetrics.zeroProceedsWithoutCurrencyRowCount`, and are excluded
+  from proceeds currency buckets.
+- **Real-report verification**: the same Daily Summary report now parses
+  **64/64 rows** with the release CLI — Summary Sales reaches
+  **LEVEL 3 — REAL_REPORT_PARSED** in `docs/VALIDATION_MATRIX.md`
+  (LEVEL 4 reconciliation still not performed; no same-basis dashboard
+  figures available). 4 new regression tests (free rows with blank
+  currency, monetary rows rejected, zero proceeds with a present
+  currency preserved, currency bucket isolation).
+
 ### Fixed (final reliability hardening)
 
 - **Transaction contention redesigned**: the sync engine's bounded

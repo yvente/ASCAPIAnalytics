@@ -416,6 +416,192 @@ final class ASCSalesReportParserTests: XCTestCase {
         XCTAssertEqual(result.records.count, 0)
     }
 
+    // MARK: - Real-report compatibility: blank proceeds currency
+
+    func testFreeRowsAllowBlankProceedsCurrency() throws {
+        let data = ASCFixtures.salesReport([
+            record(
+                productType: "1",
+                units: "4",
+                customerPrice: "0",
+                proceeds: "0",
+                proceedsCurrency: ""
+            ),
+            record(
+                productType: "1F",
+                units: "18",
+                customerPrice: "0",
+                proceeds: "0",
+                proceedsCurrency: ""
+            ),
+            record(
+                productType: "IA1",
+                units: "1",
+                customerPrice: "0.99",
+                proceeds: "0.70",
+                proceedsCurrency: "USD"
+            )
+        ])
+
+        let result = try parser.parse(data)
+
+        XCTAssertEqual(result.records.count, 3)
+        XCTAssertNil(result.records[0].proceedsCurrency)
+        XCTAssertNil(result.records[1].proceedsCurrency)
+        XCTAssertEqual(result.records[2].proceedsCurrency, "USD")
+
+        let metrics = ASCSalesMetrics(records: result.records)
+
+        XCTAssertEqual(metrics.recordCount, 3)
+        XCTAssertEqual(metrics.unitBreakdown.appUnits, 22)
+        XCTAssertEqual(metrics.unitBreakdown.inAppPurchaseUnits, 1)
+
+        XCTAssertEqual(
+            metrics.zeroProceedsWithoutCurrencyRowCount,
+            2
+        )
+
+        XCTAssertEqual(
+            metrics.developerProceedsByCurrency.count,
+            1
+        )
+        XCTAssertEqual(
+            metrics.developerProceedsByCurrency[0].currency,
+            "USD"
+        )
+        XCTAssertEqual(
+            metrics.developerProceedsByCurrency[0].proceeds,
+            Decimal(string: "0.70")
+        )
+    }
+
+    func testMissingProceedsCurrencyOnMonetaryRowsIsRejected()
+        throws {
+
+        let monetaryCases: [(price: String, proceeds: String)] = [
+            ("0.99", "0.70"),
+            ("0", "0.70"),
+            ("0.99", "0")
+        ]
+
+        for item in monetaryCases {
+            let data = ASCFixtures.salesReport([
+                record(
+                    productType: "1F",
+                    units: "1",
+                    customerPrice: item.price,
+                    proceeds: item.proceeds,
+                    proceedsCurrency: ""
+                )
+            ])
+
+            XCTAssertThrowsError(try parser.parse(data)) { error in
+                guard let analyticsError = error as? ASCAnalyticsError,
+                      case .missingRequiredField(
+                          _,
+                          let column,
+                          _
+                      ) = analyticsError else {
+                    return XCTFail(
+                        "Expected missingRequiredField, got \(error)"
+                    )
+                }
+
+                XCTAssertEqual(column, "Currency of Proceeds")
+            }
+        }
+    }
+
+    func testZeroProceedsWithPresentCurrencyIsPreserved()
+        throws {
+
+        let data = ASCFixtures.salesReport([
+            record(
+                productType: "7F",
+                units: "5",
+                customerPrice: "0",
+                proceeds: "0",
+                currency: "EUR",
+                proceedsCurrency: "EUR"
+            )
+        ])
+
+        let result = try parser.parse(data)
+
+        XCTAssertEqual(
+            result.records[0].proceedsCurrency,
+            "EUR"
+        )
+
+        let metrics = ASCSalesMetrics(records: result.records)
+
+        XCTAssertEqual(
+            metrics.zeroProceedsWithoutCurrencyRowCount,
+            0
+        )
+
+        XCTAssertEqual(metrics.unitBreakdown.updateUnits, 5)
+        XCTAssertEqual(
+            metrics.developerProceedsByCurrency[0].currency,
+            "EUR"
+        )
+        XCTAssertEqual(
+            metrics.developerProceedsByCurrency[0].proceeds,
+            0
+        )
+    }
+
+    func testBlankZeroCurrencyDoesNotCreateCurrencyBucket()
+        throws {
+
+        let data = ASCFixtures.salesReport([
+            record(
+                productType: "1",
+                units: "3",
+                customerPrice: "0",
+                proceeds: "0",
+                currency: "JPY",
+                proceedsCurrency: ""
+            ),
+            record(
+                productType: "IA1",
+                units: "2",
+                customerPrice: "1.99",
+                proceeds: "1.40",
+                currency: "USD",
+                proceedsCurrency: "USD"
+            ),
+            record(
+                productType: "IA1",
+                units: "1",
+                customerPrice: "2.49",
+                proceeds: "1.70",
+                currency: "EUR",
+                proceedsCurrency: "EUR"
+            )
+        ])
+
+        let parsed = try parser.parse(data)
+        let metrics = ASCSalesMetrics(records: parsed.records)
+
+        XCTAssertEqual(
+            metrics.grossSalesByCustomerCurrency.map(\.currency),
+            ["EUR", "JPY", "USD"]
+        )
+
+        XCTAssertEqual(
+            metrics.developerProceedsByCurrency.map(\.currency),
+            ["EUR", "USD"]
+        )
+
+        XCTAssertEqual(metrics.unitBreakdown.appUnits, 3)
+
+        XCTAssertEqual(
+            metrics.zeroProceedsWithoutCurrencyRowCount,
+            1
+        )
+    }
+
     func testSubscriptionUpgradeExampleFromAppleDocs() throws {
         // Apple's "Subscription Upgrade with Partial Credit" example
         // (post-Nov 2016 convention): credit refunded as a negative row,

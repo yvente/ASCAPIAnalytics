@@ -146,8 +146,15 @@ public struct ASCSalesRecord:
     /// unit"), in `Currency of Proceeds`. On refund and credit rows Apple
     /// reports a positive per-unit value while Units are negative.
     public let developerProceeds: Decimal
-    /// `Currency of Proceeds` (three-letter ISO code).
-    public let proceedsCurrency: String
+    /// Currency in which developer proceeds are paid.
+    ///
+    /// Apple may leave this field blank on zero-price,
+    /// zero-proceeds transactions.
+    ///
+    /// `nil` means the report did not specify a currency.
+    /// It must never be interpreted as USD or inferred from
+    /// `Customer Currency`.
+    public let proceedsCurrency: String?
     /// `Country Code` (two-letter ISO code of the App Store storefront).
     public let countryCode: String
     /// Classified `CMB` column value.
@@ -327,23 +334,75 @@ public struct ASCSalesReportParser: Sendable {
         let rawProductType = try table.requiredString("Product Type Identifier", row: row)
         let units = try table.decimal("Units", row: row)
         let customerPrice = try table.decimal("Customer Price", row: row)
-        let customerCurrency = try table.requiredString("Customer Currency", row: row)
-        let developerProceeds = try table.decimal("Developer Proceeds", row: row)
-        let proceedsCurrency = try table.requiredString("Currency of Proceeds", row: row)
-        let countryCode = try table.requiredString("Country Code", row: row)
+        let customerCurrency = try table.requiredString(
+            "Customer Currency",
+            row: row
+        )
 
+        let developerProceeds = try table.decimal(
+            "Developer Proceeds",
+            row: row
+        )
+
+        let proceedsCurrency = try table.optionalString(
+            "Currency of Proceeds",
+            row: row
+        )
+
+        let countryCode = try table.requiredString(
+            "Country Code",
+            row: row
+        )
+
+        // Empirical compatibility rule:
+        //
+        // Apple Summary Sales reports can leave Currency of
+        // Proceeds blank for zero-price, zero-proceeds rows.
+        //
+        // This is not permission to omit the currency of a
+        // monetary transaction.
+        //
+        // The column must still exist in the report header.
+        if proceedsCurrency == nil {
+            guard customerPrice == 0,
+                  developerProceeds == 0 else {
+                throw ASCAnalyticsError.missingRequiredField(
+                    report: Self.reportName,
+                    column: "Currency of Proceeds",
+                    line: row.lineNumber
+                )
+            }
+        }
+
+        // Customer Currency and Country Code remain required.
         for (value, column, length) in [
             (customerCurrency, "Customer Currency", 3),
-            (proceedsCurrency, "Currency of Proceeds", 3),
             (countryCode, "Country Code", 2),
         ] {
             guard value.count == length,
-                  value.allSatisfy({ $0.isASCII && $0.isLetter })
-            else {
+                  value.allSatisfy({
+                      $0.isASCII && $0.isLetter
+                  }) else {
                 throw ASCAnalyticsError.invalidFieldValue(
                     report: Self.reportName, column: column, value: value,
                     line: row.lineNumber,
                     reason: "expected \(length)-letter ISO code"
+                )
+            }
+        }
+
+        // A present proceeds currency must still be valid.
+        if let proceedsCurrency {
+            guard proceedsCurrency.count == 3,
+                  proceedsCurrency.allSatisfy({
+                      $0.isASCII && $0.isLetter
+                  }) else {
+                throw ASCAnalyticsError.invalidFieldValue(
+                    report: Self.reportName,
+                    column: "Currency of Proceeds",
+                    value: proceedsCurrency,
+                    line: row.lineNumber,
+                    reason: "expected 3-letter ISO code"
                 )
             }
         }

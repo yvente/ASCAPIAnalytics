@@ -103,11 +103,12 @@ reporting data — the reporting companion to
   published report files; where a report basis differs from a dashboard
   metric, that is documented in `docs/METRIC_DEFINITIONS.md` rather than
   hidden.
-- **Real-report verification**: no real Apple report was available during
-  development (`REAL_APPLE_REPORT_VALIDATION = NOT_RUN_NO_PRIVATE_REPORT`);
-  every report is honestly certified at LEVEL 2 (official format verified)
-  in `docs/VALIDATION_MATRIX.md`. Run the verification CLI locally with a
-  private report to reach LEVEL 3/4.
+- **Real-report verification**: a real Apple Daily Summary Sales report
+  (2026-10-28) parses **64/64 rows** — Summary Sales is certified at
+  **LEVEL 3 (REAL_REPORT_PARSED)** in `docs/VALIDATION_MATRIX.md`; the
+  Analytics report families remain at LEVEL 2 (official format verified;
+  no real reports available). Run the verification CLI locally with a
+  private report to reach LEVEL 3/4 for those.
 - Weekly/monthly Analytics instances and the remaining Analytics report
   families (usage, performance, commerce) parse only through the generic
   machinery; their dedicated models and metrics are future work.

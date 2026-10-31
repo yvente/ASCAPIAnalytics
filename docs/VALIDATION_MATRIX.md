@@ -14,11 +14,12 @@ LEVEL 4 never means the package reproduces every App Store Connect
 dashboard metric — only that the named metrics, report, and scope were
 reconciled.
 
-**Current overall status: `REAL_APPLE_REPORT_VALIDATION = NOT_RUN_NO_PRIVATE_REPORT`.**
-No real Apple report was available on this machine during development; the
-highest honestly reachable level is LEVEL 2 for every report below. See
-[REAL_REPORT_VALIDATION.md](REAL_REPORT_VALIDATION.md) for how to reach
-LEVEL 3/4 locally with a private report.
+**Current overall status: Summary Sales = LEVEL 3 (REAL_REPORT_PARSED,
+2026-10-31); App Downloads and Discovery and Engagement = LEVEL 2
+(`REAL_REPORT_VALIDATION = NOT_RUN_NO_PRIVATE_REPORT` for those
+families).** See [REAL_REPORT_VALIDATION.md](REAL_REPORT_VALIDATION.md)
+for the verification log and how to reach LEVEL 3/4 locally with a
+private report.
 
 Documentation sources below were re-checked against the live Apple pages
 on **2026-10-31**:
@@ -38,7 +39,7 @@ on **2026-10-31**:
 
 ---
 
-## Summary Sales Report — LEVEL 2
+## Summary Sales Report — LEVEL 3 (REAL_REPORT_PARSED)
 
 | Item | Status |
 |---|---|

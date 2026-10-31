@@ -88,6 +88,13 @@ public struct ASCSalesMetrics: Hashable, Codable, Sendable {
     /// purchases with a blank Parent Identifier). They contribute to
     /// currency totals but not to any app grouping.
     public let unattributedRowCount: Int
+    /// Count of zero-price, zero-proceeds rows for which
+    /// Apple did not provide Currency of Proceeds.
+    ///
+    /// These rows still contribute to units and product
+    /// breakdowns, but cannot be assigned to any proceeds
+    /// currency bucket.
+    public let zeroProceedsWithoutCurrencyRowCount: Int
     /// Number of records this metrics value was computed from.
     public let recordCount: Int
 
@@ -108,24 +115,36 @@ public struct ASCSalesMetrics: Hashable, Codable, Sendable {
         var refundUnits = Decimal(0)
         var zeroPriceUnits = Decimal(0)
         var unattributed = 0
+        var zeroProceedsWithoutCurrencyRows = 0
 
         for record in records {
             let customerKey = record.customerCurrency.uppercased()
-            let proceedsKey = record.proceedsCurrency.uppercased()
 
+            // Customer Currency is required for every row.
             let gross = grossByCurrency[customerKey] ?? (0, 0, 0)
+
             grossByCurrency[customerKey] = (
                 gross.amount + record.grossSalesImpact,
                 gross.units + record.units,
                 gross.count + 1
             )
 
-            let proceeds = proceedsByCurrency[proceedsKey] ?? (0, 0, 0)
-            proceedsByCurrency[proceedsKey] = (
-                proceeds.amount + record.developerProceedsImpact,
-                proceeds.units + record.units,
-                proceeds.count + 1
-            )
+            // Currency of Proceeds can be absent only on a
+            // validated zero-price / zero-proceeds transaction.
+            //
+            // Do not invent a currency, and do not group such
+            // records under an empty-string key.
+            if let proceedsKey = record.proceedsCurrency?.uppercased() {
+                let proceeds = proceedsByCurrency[proceedsKey] ?? (0, 0, 0)
+
+                proceedsByCurrency[proceedsKey] = (
+                    proceeds.amount + record.developerProceedsImpact,
+                    proceeds.units + record.units,
+                    proceeds.count + 1
+                )
+            } else {
+                zeroProceedsWithoutCurrencyRows += 1
+            }
 
             switch record.productType {
             case .app: appUnits += record.units
@@ -194,6 +213,8 @@ public struct ASCSalesMetrics: Hashable, Codable, Sendable {
         self.unknownProductTypeIdentifiers = unknownIdentifiers.sorted()
         self.unattributedRowCount = unattributed
         self.recordCount = records.count
+        self.zeroProceedsWithoutCurrencyRowCount =
+            zeroProceedsWithoutCurrencyRows
     }
 
     /// Gross sales in exactly one Customer Currency.

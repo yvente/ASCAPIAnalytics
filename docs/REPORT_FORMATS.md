@@ -39,7 +39,7 @@ Required columns parsed (version 1_3):
 | Customer Price | `DECIMAL(18,2)` | Per unit, Customer Currency; negative = refund or CMB-C credit |
 | Customer Currency | `CHAR(3)` | ISO code |
 | Developer Proceeds | `DECIMAL(18,2)` | **Per unit**, Currency of Proceeds; **positive** on refund rows |
-| Currency of Proceeds | `CHAR(3)` | ISO code — a different currency space from Customer Currency |
+| Currency of Proceeds | `CHAR(3)` | ISO code — a different currency space from Customer Currency. **Real-report observation (2026-10-28 Daily Summary): Apple leaves this column blank on zero-price, zero-proceeds rows (free downloads/updates).** The parser therefore accepts a blank value only when both amounts are zero and represents it as `nil` — never a fabricated currency. A populated value must still be a 3-letter ISO code; a monetary row (non-zero price or proceeds) without a proceeds currency is a hard error. |
 | Country Code | `CHAR(2)` | ISO storefront code |
 | CMB | `VARCHAR(5)` | `CMB` = completes an app bundle; `CMB-C` = credit for a previously purchased app; blank otherwise |
 
@@ -57,6 +57,12 @@ All other columns (Provider, Provider Country, Developer, Title, Version,
 Promo Code, Subscription, Period, Category, Supported Platforms, Device,
 Preserved Pricing, Proceeds Reason, Client, Order Type, …) are preserved
 verbatim in `extraFields`.
+
+Zero-proceeds rows without a Currency of Proceeds are counted in
+`ASCSalesMetrics.zeroProceedsWithoutCurrencyRowCount` and excluded from
+proceeds currency buckets (they still contribute units and product-type
+breakdowns). A real 2026-10-28 Daily Summary report parsed 64/64 rows
+under this rule.
 
 ## 2. App Downloads report (Analytics Reports API) — implemented
 
