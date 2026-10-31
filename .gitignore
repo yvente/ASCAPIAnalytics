@@ -1,0 +1,43 @@
+# --- SwiftPM / Xcode build artifacts ---
+.build/
+# Libraries with .upToNextMinor constraints do not pin resolved versions.
+Package.resolved
+.swiftpm/xcode/
+.swiftpm/configuration/
+.swiftpm/repositories/
+.swiftpm/checkouts/
+.swiftpm/cache/
+DerivedData/
+xcuserdata/
+*.xcuserstate
+
+# --- macOS / editor noise ---
+.DS_Store
+*.swp
+*~
+
+# --- Secrets and credentials (never commit) ---
+.env
+.env.*
+!.env.example
+*.p8
+AuthKey_*
+*.pem
+*.key
+*.p12
+*.cer
+*.crt
+*.mobileprovision
+
+# --- Real App Store Connect report downloads (never commit) ---
+# Sales and Trends / Analytics exports are gzipped TSV/CSV files.
+*.gz
+*.tsv
+*.csv
+# Synthetic hand-crafted fixtures under Tests are allowed:
+!Tests/**/Fixtures/**
+
+# --- Temporary and private local data ---
+/tmp/
+/private-data/
+/local-data/
