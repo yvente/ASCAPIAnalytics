@@ -202,19 +202,25 @@ transaction:
 - Failures and cancellations roll the transaction back; partial data is
   impossible.
 - **Store contract:** implementations must serialize transaction
-  windows on a store. The reference in-memory store queues
-  `beginTransaction` callers in **FIFO order with asynchronous waiting**
-  (continuation-based; no busy waiting, no retry caps): at most one
-  write transaction is active, waiters are cancellation-safe (a
-  cancelled waiter is skipped in grant order and ends with
-  `CancellationError`), and a transaction dropped unfinished by its
-  owner cannot stall the store — the next begin reclaims the slot.
+  windows on a store. The reference in-memory store gives the write
+  slot exactly **one owner**, identified by the transaction's UUID: the
+  store does not retain the active transaction; a dropped unfinished
+  transaction releases ownership synchronously from `deinit`, waking
+  queued waiters. Commit (or rollback) verifies ownership, publishes
+  staged data, releases ownership, and grants the next FIFO waiter
+  **under one store lock** — there is no observable gap between
+  completing a transaction and handing the slot to its successor.
+  `beginTransaction` callers wait asynchronously in FIFO order;
+  cancellation while queued skips the waiter (it ends with
+  `CancellationError` and never takes the slot). A transaction held
+  live by a task that never commits or rolls back keeps the slot — no
+  automatic timeout, preemption, or retry exists.
   `ASCAnalyticsError.storeInconsistentState` is reserved for real
-  store-protocol misuse (double commit, use after finish) and is
-  **never** transient contention. An implementation whose transactions
-  do not serialize read-decide-write windows cannot guarantee
-  single-import under concurrency — such an implementation must not
-  claim this contract.
+  store-protocol misuse (ownership mismatch, double commit, use after
+  finish) and is **never** transient contention. An implementation
+  whose transactions do not serialize read-decide-write windows cannot
+  guarantee single-import under concurrency — such an implementation
+  must not claim this contract.
 
 ## What the engine does not do
 

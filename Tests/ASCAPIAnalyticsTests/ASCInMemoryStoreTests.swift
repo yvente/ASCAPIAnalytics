@@ -354,6 +354,218 @@ final class ASCInMemoryStoreTests: XCTestCase {
         XCTAssertEqual(otherOnly[0].record.units, 7)
     }
 
+    // MARK: - Ownership atomicity (installed from architecture review)
+
+    func testAbandonedOwnerWakesExistingWaiter() async throws {
+        let localStore = ASCInMemoryAnalyticsStore()
+
+        var active: (any ASCAnalyticsStoreTransaction)?
+            = try await localStore.beginTransaction()
+
+        let queued = expectation(
+            description: "waiting transaction queued"
+        )
+
+        localStore.onBeginScheduled = { depth in
+            if depth == 1 {
+                queued.fulfill()
+            }
+        }
+
+        let waiter = Task {
+            let tx = try await localStore.beginTransaction()
+            try await tx.rollback()
+            return true
+        }
+
+        await fulfillment(of: [queued], timeout: 10)
+
+        // A is dropped without an explicit commit or rollback.
+        active = nil
+
+        let completed = try await waiter.value
+
+        XCTAssertTrue(completed)
+
+        // Confirm the store remains usable.
+        try await localStore.withTransaction { _ in }
+    }
+
+    func testQueuedTransactionSeesCompletedCommit()
+        async throws {
+
+        let localStore = ASCInMemoryAnalyticsStore()
+
+        let key = ASCIngestionKey(
+            sourceKind: .summarySales,
+            vendorNumber: "80000",
+            reportDate: "2025-10-01",
+            reportVersion: "1"
+        )
+
+        let active = try await localStore.beginTransaction()
+
+        try await active.upsertIngestion(
+            ASCIngestionEntry(
+                key: key,
+                state: .imported,
+                schemaFingerprint: "test-schema",
+                contentChecksum: "committed",
+                recordCount: 0,
+                importedAt: Date()
+            )
+        )
+
+        let queued = expectation(
+            description: "reader queued behind writer"
+        )
+
+        localStore.onBeginScheduled = { depth in
+            if depth == 1 {
+                queued.fulfill()
+            }
+        }
+
+        let reader = Task {
+            let tx = try await localStore.beginTransaction()
+            let entry = try await tx.ingestion(matching: key)
+            try await tx.rollback()
+            return entry
+        }
+
+        await fulfillment(of: [queued], timeout: 10)
+
+        try await active.commit()
+
+        let entry = try await reader.value
+
+        XCTAssertEqual(entry?.contentChecksum, "committed")
+    }
+
+    func testFinishedOldOwnerCannotReleaseNewOwner()
+        async throws {
+
+        let localStore = ASCInMemoryAnalyticsStore()
+
+        let first = try await localStore.beginTransaction()
+
+        let secondQueued = expectation(
+            description: "second transaction queued"
+        )
+
+        localStore.onBeginScheduled = { depth in
+            if depth == 1 {
+                secondQueued.fulfill()
+            }
+        }
+
+        let secondTask = Task {
+            try await localStore.beginTransaction()
+        }
+
+        await fulfillment(
+            of: [secondQueued],
+            timeout: 10
+        )
+
+        try await first.commit()
+
+        let second = try await secondTask.value
+
+        // A double-finish must fail without changing ownership.
+        do {
+            try await first.rollback()
+            XCTFail("old owner must not finish again")
+        } catch let error as ASCAnalyticsError {
+            guard case .storeInconsistentState = error else {
+                XCTFail("unexpected error: \(error)")
+                return
+            }
+        }
+
+        let thirdQueued = expectation(
+            description: "third transaction queued"
+        )
+
+        localStore.onBeginScheduled = { depth in
+            if depth == 1 {
+                thirdQueued.fulfill()
+            }
+        }
+
+        let thirdTask = Task {
+            try await localStore.beginTransaction()
+        }
+
+        await fulfillment(
+            of: [thirdQueued],
+            timeout: 10
+        )
+
+        // The third task remains queued until the actual
+        // current owner, second, releases its slot.
+        try await second.rollback()
+
+        let third = try await thirdTask.value
+        try await third.rollback()
+    }
+
+    func testAbandonmentPreservesFIFOOrder() async throws {
+        let localStore = ASCInMemoryAnalyticsStore()
+        let recorder = ASCTransactionOrderRecorder()
+
+        var first: (any ASCAnalyticsStoreTransaction)?
+            = try await localStore.beginTransaction()
+
+        let secondQueued = expectation(
+            description: "second queued"
+        )
+        let thirdQueued = expectation(
+            description: "third queued"
+        )
+
+        localStore.onBeginScheduled = { depth in
+            if depth == 1 {
+                secondQueued.fulfill()
+            }
+            if depth == 2 {
+                thirdQueued.fulfill()
+            }
+        }
+
+        let secondTask = Task {
+            let tx = try await localStore.beginTransaction()
+            await recorder.record(2)
+            try await tx.rollback()
+        }
+
+        await fulfillment(
+            of: [secondQueued],
+            timeout: 10
+        )
+
+        let thirdTask = Task {
+            let tx = try await localStore.beginTransaction()
+            await recorder.record(3)
+            try await tx.rollback()
+        }
+
+        await fulfillment(
+            of: [thirdQueued],
+            timeout: 10
+        )
+
+        // Releases ownership through deinit, not an explicit rollback.
+        first = nil
+
+        try await secondTask.value
+        try await thirdTask.value
+
+        let order = await recorder.snapshot()
+
+        XCTAssertEqual(order, [2, 3])
+    }
+
     func testDateAndAppQueries() async throws {
         let key = makeKey(version: "1")
         var october = makeSalesRecord(units: 1)
@@ -399,5 +611,17 @@ final class ASCInMemoryStoreTests: XCTestCase {
         XCTAssertEqual(byApp.count, 1)
         let byWrongApp = try await store.salesRecords(appAppleIdentifiers: ["9999"])
         XCTAssertEqual(byWrongApp.count, 0)
+    }
+}
+
+private actor ASCTransactionOrderRecorder {
+    private var grants: [Int] = []
+
+    func record(_ number: Int) {
+        grants.append(number)
+    }
+
+    func snapshot() -> [Int] {
+        grants
     }
 }
