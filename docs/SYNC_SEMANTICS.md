@@ -184,6 +184,31 @@ report kinds, granularities, or logical variants, instead of producing a
 total that looks correct but is not. Select one scope first, or aggregate
 each scope separately.
 
+## Concurrent syncs on one store
+
+Multiple `ASCReportSyncEngine` instances (or tasks) may share one store.
+The engine holds no locks of its own; atomicity comes from the store
+transaction:
+
+- After downloading (never inside a transaction), each sync opens **one**
+  transaction, **re-reads the ledger inside it**, applies its whole
+  decision table there, writes there, and commits. Two syncs of the same
+  report therefore serialize at the transaction: the loser's re-read
+  observes the winner's commit and skips (or quarantines) instead of
+  double-inserting.
+- Version comparisons and supersessions happen inside that same
+  transaction, so an older version can never reverse-supersede a newer
+  one under concurrency.
+- Failures and cancellations roll the transaction back; partial data is
+  impossible.
+- **Store contract:** implementations must serialize transaction
+  windows on a store (the reference in-memory store allows one live
+  transaction at a time and rejects a second with
+  `storeInconsistentState`, which the engine retries bounded times). An
+  implementation whose transactions do not serialize read-decide-write
+  windows cannot guarantee single-import under concurrency — such an
+  implementation must not claim this contract.
+
 ## What the engine does not do
 
 - **No scheduling.** The host app decides when to run the engine.

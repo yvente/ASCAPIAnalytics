@@ -235,64 +235,70 @@ public struct ASCAnalyticsAggregator: Sendable {
         _ records: [ASCProvenancedRecord<ASCDownloadRecord>],
         filter: ASCAnalyticsFilter = ASCAnalyticsFilter()
     ) throws -> ASCDownloadSummary {
-        // Dimension filters that do not interact with selection first.
-        var prefiltered = records
+        // 1. Scope-level filters first — they operate on whole overwrite
+        //    groups (the app identifier is part of the selection key), so
+        //    they cannot change which instance is the latest.
+        var scoped = records
         if let appIdentifiers = filter.appIdentifiers {
-            prefiltered = prefiltered.filter {
+            scoped = scoped.filter {
                 appIdentifiers.contains($0.record.appAppleIdentifier)
             }
         }
+        // 2. The overwrite rule on the FULL scope, BEFORE any row-level
+        //    display filtering such as territory: a corrected instance may
+        //    have dropped a territory entirely, and filtering by territory
+        //    first would leave the older instance's retracted rows as the
+        //    only records of their group and wrongly resurrect them.
+        let selected = ASCInstanceSelection.latestProcessingDatePerEventDate(scoped)
+        // 3. Display filters on the effective records.
+        var displayFiltered = selected
         if let territories = filter.territories {
-            prefiltered = prefiltered.filter {
+            displayFiltered = displayFiltered.filter {
                 territories.contains($0.record.territory)
             }
         }
-        // Overwrite rule per (app, variant, granularity, date).
-        let selected = ASCInstanceSelection.latestProcessingDatePerEventDate(prefiltered)
-        // Date range last: the latest instance may cover a wider range.
-        let dateFiltered: [ASCProvenancedRecord<ASCDownloadRecord>]
         if let range = filter.dateRange {
-            dateFiltered = selected.filter { range.contains($0.record.date) }
-        } else {
-            dateFiltered = selected
+            displayFiltered = displayFiltered.filter { range.contains($0.record.date) }
         }
         try Self.verifySingleMetricScope(
-            dateFiltered.map { ($0.record, $0.provenance) }
+            displayFiltered.map { ($0.record, $0.provenance) }
         )
         var effectiveFilter = filter
+        effectiveFilter.territories = nil
         effectiveFilter.dateRange = nil
-        return downloads(dateFiltered.map(\.record), filter: effectiveFilter)
+        return downloads(displayFiltered.map(\.record), filter: effectiveFilter)
     }
 
-    /// Same as `downloads(_:_:)` for discovery records.
+    /// Same as `downloads(_:_:)` for discovery records: the overwrite
+    /// rule is applied on the full scope before territory and date
+    /// display filters.
     public func discovery(
         _ records: [ASCProvenancedRecord<ASCDiscoveryRecord>],
         filter: ASCAnalyticsFilter = ASCAnalyticsFilter()
     ) throws -> ASCDiscoverySummary {
-        var prefiltered = records
+        var scoped = records
         if let appIdentifiers = filter.appIdentifiers {
-            prefiltered = prefiltered.filter {
+            scoped = scoped.filter {
                 appIdentifiers.contains($0.record.appAppleIdentifier)
             }
         }
+        let selected = ASCInstanceSelection.latestProcessingDatePerEventDate(scoped)
+        var displayFiltered = selected
         if let territories = filter.territories {
-            prefiltered = prefiltered.filter {
+            displayFiltered = displayFiltered.filter {
                 territories.contains($0.record.territory)
             }
         }
-        let selected = ASCInstanceSelection.latestProcessingDatePerEventDate(prefiltered)
-        let dateFiltered: [ASCProvenancedRecord<ASCDiscoveryRecord>]
         if let range = filter.dateRange {
-            dateFiltered = selected.filter { range.contains($0.record.date) }
-        } else {
-            dateFiltered = selected
+            displayFiltered = displayFiltered.filter { range.contains($0.record.date) }
         }
         try Self.verifySingleMetricScope(
-            dateFiltered.map { ($0.record, $0.provenance) }
+            displayFiltered.map { ($0.record, $0.provenance) }
         )
         var effectiveFilter = filter
+        effectiveFilter.territories = nil
         effectiveFilter.dateRange = nil
-        return discovery(dateFiltered.map(\.record), filter: effectiveFilter)
+        return discovery(displayFiltered.map(\.record), filter: effectiveFilter)
     }
 
     /// Throws `ambiguousMetricScope` when the records span more than one

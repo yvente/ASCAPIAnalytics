@@ -255,6 +255,35 @@ public struct ASCReportSyncEngine: Sendable {
         self.provider = provider
     }
 
+    /// Runs a post-download decision inside one atomic store transaction.
+    ///
+    /// The decision body re-reads the ledger **inside** the transaction and
+    /// performs all writes there, so two engines sharing one store can
+    /// never both decide "not imported" and both commit: the store
+    /// serializes the decision windows, and the loser's re-read observes
+    /// the winner's commit. When another engine holds the store's
+    /// transaction slot, the attempt is retried (bounded) after a
+    /// cooperative yield — no network I/O ever happens inside the
+    /// transaction, so retries are cheap and deterministic under test
+    /// gates.
+    private func withDecisionTransaction<T: Sendable>(
+        store: any ASCAnalyticsStore,
+        _ body: (any ASCAnalyticsStoreTransaction) async throws -> T
+    ) async throws -> T {
+        var attempts = 0
+        while true {
+            do {
+                return try await store.withTransaction(body)
+            } catch let error as ASCAnalyticsError {
+                guard case .storeInconsistentState = error, attempts < 64 else {
+                    throw error
+                }
+                attempts += 1
+                await Task.yield()
+            }
+        }
+    }
+
     // MARK: - Analytics sync
 
     /// Syncs Analytics report instances for one app.
@@ -365,13 +394,23 @@ public struct ASCReportSyncEngine: Sendable {
         let allDeclaredChecksumsPresent = segments.allSatisfy {
             ($0.attributes.checksum ?? "").isEmpty == false
         }
+        // Cheap pre-download fast path. It is advisory only: under
+        // concurrent syncs the store's transaction slot may be held by
+        // another engine (probe fails → fast path disabled) and the state
+        // may be stale either way — the authoritative decision re-reads
+        // the ledger inside the commit transaction below.
         let lookupKey = ASCIngestionKey(sourceKind: .unknown, instanceID: instance.id)
-        let probe = try await store.beginTransaction()
-        let existing = try await probe.ingestion(matching: lookupKey)
-        try await probe.rollback()
-        if let existing, existing.state == .imported,
+        var probedExisting: ASCIngestionEntry?
+        do {
+            let probe = try await store.beginTransaction()
+            probedExisting = try await probe.ingestion(matching: lookupKey)
+            try await probe.rollback()
+        } catch {
+            probedExisting = nil
+        }
+        if let probedExisting, probedExisting.state == .imported,
            allDeclaredChecksumsPresent,
-           declared == existing.segmentChecksums {
+           declared == probedExisting.segmentChecksums {
             return outcome(.skippedAlreadyImported)
         }
 
@@ -481,81 +520,6 @@ public struct ASCReportSyncEngine: Sendable {
                 : .analyticsDiscoveryAndEngagement,
             instanceID: instance.id
         )
-
-        // Same content as before (any state): already processed, skip.
-        // This is the revalidation strategy when Apple declares no
-        // checksums: the actual bytes decide.
-        if let existing, existing.contentChecksum == combinedChecksum {
-            return outcome(.skippedAlreadyImported)
-        }
-
-        // Same identity, different content: semantics unproven. The
-        // previously imported data stays untouched and counted; the
-        // conflicting delivery is recorded under its own delivery key and
-        // excluded from queries until reviewed.
-        if let existing {
-            let pendingKey = ingestionKey.withDeliveryID(combinedChecksum)
-            let granularity = instance.attributes.granularity.flatMap {
-                ASCReportGranularity(rawValue: $0.rawValue)
-            }
-            var provenanced: [ASCProvenancedRecord<ASCDownloadRecord>] = []
-            var provenancedDiscovery: [ASCProvenancedRecord<ASCDiscoveryRecord>] = []
-            var recordCount = 0
-            for (index, item) in parsed.enumerated() {
-                let entry = segmentData[index]
-                let segmentProvenance = ASCReportProvenance(
-                    sourceKind: ingestionKey.sourceKind,
-                    reportName: report.attributes.name,
-                    category: report.attributes.category?.rawValue,
-                    reportRequestID: reportRequestID,
-                    reportID: report.id,
-                    instanceID: instance.id,
-                    segmentID: entry.segment.id,
-                    processingDate: instance.attributes.processingDate,
-                    granularity: granularity,
-                    schemaFingerprint: schemaFingerprint,
-                    canonicalSchemaIdentity: canonicalSchemaIdentity,
-                    contentChecksum: entry.checksum,
-                    fetchedAt: Date(),
-                    recordCount: 0
-                )
-                switch item {
-                case .downloads(let result):
-                    recordCount += result.records.count
-                    provenanced.append(contentsOf: result.records.map {
-                        ASCProvenancedRecord(record: $0, provenance: segmentProvenance)
-                    })
-                case .discovery(let result):
-                    recordCount += result.records.count
-                    provenancedDiscovery.append(contentsOf: result.records.map {
-                        ASCProvenancedRecord(record: $0, provenance: segmentProvenance)
-                    })
-                }
-            }
-            let entry = ASCIngestionEntry(
-                key: pendingKey,
-                state: .pendingReview,
-                processingDate: instance.attributes.processingDate,
-                granularity: granularity,
-                reportName: report.attributes.name,
-                category: report.attributes.category?.rawValue,
-                segmentIDs: segments.map(\.id),
-                segmentChecksums: declared,
-                schemaFingerprint: schemaFingerprint,
-                contentChecksum: combinedChecksum,
-                recordCount: recordCount,
-                importedAt: Date(),
-                pendingReason: "instance \(instance.id) was previously imported with different content (\(existing.contentChecksum)); Apple's update semantics for mutated instances are not documented, so this delivery is retained but excluded until reviewed"
-            )
-            try await store.withTransaction { transaction in
-                try await transaction.insertDownloads(provenanced, ingestionKey: pendingKey)
-                try await transaction.insertDiscovery(provenancedDiscovery, ingestionKey: pendingKey)
-                try await transaction.upsertIngestion(entry)
-            }
-            return outcome(.pendingReview(reason: entry.pendingReason ?? "content changed"))
-        }
-
-        // Atomic commit: ledger entry plus all records in one transaction.
         let now = Date()
         let granularity = instance.attributes.granularity.flatMap {
             ASCReportGranularity(rawValue: $0.rawValue)
@@ -576,23 +540,19 @@ public struct ASCReportSyncEngine: Sendable {
             recordCount: 0
         )
 
-        var totalRecords = 0
         var provenancedDownloads: [ASCProvenancedRecord<ASCDownloadRecord>] = []
         var provenancedDiscovery: [ASCProvenancedRecord<ASCDiscoveryRecord>] = []
-
         for (index, item) in parsed.enumerated() {
             let entry = segmentData[index]
             let segmentProvenance = context.withSegmentID(entry.segment.id)
             switch item {
             case .downloads(let result):
-                totalRecords += result.records.count
                 provenancedDownloads.append(
                     contentsOf: result.records.map {
                         ASCProvenancedRecord(record: $0, provenance: segmentProvenance)
                     }
                 )
             case .discovery(let result):
-                totalRecords += result.records.count
                 provenancedDiscovery.append(
                     contentsOf: result.records.map {
                         ASCProvenancedRecord(record: $0, provenance: segmentProvenance)
@@ -600,29 +560,71 @@ public struct ASCReportSyncEngine: Sendable {
                 )
             }
         }
+        let totalRecords = provenancedDownloads.count + provenancedDiscovery.count
 
-        let ledgerEntry = ASCIngestionEntry(
-            key: ingestionKey,
-            state: .imported,
-            processingDate: instance.attributes.processingDate,
-            granularity: granularity,
-            reportName: report.attributes.name,
-            category: report.attributes.category?.rawValue,
-            segmentIDs: segments.map(\.id),
-            segmentChecksums: declared,
-            schemaFingerprint: schemaFingerprint,
-            contentChecksum: combinedChecksum,
-            recordCount: totalRecords,
-            importedAt: now
-        )
+        // Authoritative decision, atomically: concurrent engines sharing
+        // one store serialize here, and the ledger is **re-read inside the
+        // transaction** — after the network download — closing the
+        // probe-commit gap that let two syncs of the same instance both
+        // import. No Apple network call happens inside the transaction.
+        return try await withDecisionTransaction(store: store) { transaction in
+            let existing = try await transaction.ingestion(matching: lookupKey)
 
-        try await store.withTransaction { transaction in
+            // Same content as before (any state): already processed, skip.
+            // This is the revalidation strategy when Apple declares no
+            // checksums: the actual bytes decide.
+            if let existing, existing.contentChecksum == combinedChecksum {
+                return outcome(.skippedAlreadyImported)
+            }
+
+            // Same identity, different content: semantics unproven. The
+            // previously imported data stays untouched and counted; the
+            // conflicting delivery is recorded under its own delivery key
+            // and excluded from queries until reviewed.
+            if let existing {
+                let pendingKey = ingestionKey.withDeliveryID(combinedChecksum)
+                let entry = ASCIngestionEntry(
+                    key: pendingKey,
+                    state: .pendingReview,
+                    processingDate: instance.attributes.processingDate,
+                    granularity: granularity,
+                    reportName: report.attributes.name,
+                    category: report.attributes.category?.rawValue,
+                    segmentIDs: segments.map(\.id),
+                    segmentChecksums: declared,
+                    schemaFingerprint: schemaFingerprint,
+                    contentChecksum: combinedChecksum,
+                    recordCount: provenancedDownloads.count + provenancedDiscovery.count,
+                    importedAt: now,
+                    pendingReason: "instance \(instance.id) was previously imported with different content (\(existing.contentChecksum)); Apple's update semantics for mutated instances are not documented, so this delivery is retained but excluded until reviewed"
+                )
+                try await transaction.insertDownloads(provenancedDownloads, ingestionKey: pendingKey)
+                try await transaction.insertDiscovery(provenancedDiscovery, ingestionKey: pendingKey)
+                try await transaction.upsertIngestion(entry)
+                return outcome(.pendingReview(reason: entry.pendingReason ?? "content changed"))
+            }
+
+            // First import of this identity: ledger entry plus all records
+            // in the same transaction.
+            let ledgerEntry = ASCIngestionEntry(
+                key: ingestionKey,
+                state: .imported,
+                processingDate: instance.attributes.processingDate,
+                granularity: granularity,
+                reportName: report.attributes.name,
+                category: report.attributes.category?.rawValue,
+                segmentIDs: segments.map(\.id),
+                segmentChecksums: declared,
+                schemaFingerprint: schemaFingerprint,
+                contentChecksum: combinedChecksum,
+                recordCount: totalRecords,
+                importedAt: now
+            )
             try await transaction.insertDownloads(provenancedDownloads, ingestionKey: ingestionKey)
             try await transaction.insertDiscovery(provenancedDiscovery, ingestionKey: ingestionKey)
             try await transaction.upsertIngestion(ledgerEntry)
+            return outcome(.imported(recordCount: totalRecords))
         }
-
-        return outcome(.imported(recordCount: totalRecords))
     }
 
     /// Determines which supported analytics report a segment belongs to,
@@ -758,95 +760,55 @@ public struct ASCReportSyncEngine: Sendable {
             )
         }
 
-        // All candidate entries for the full identity minus version:
-        // (source kind, vendor, type/subtype/frequency, report date).
-        let probe = try await store.beginTransaction()
-        let allEntries = try await probe.ingestionEntries(state: nil)
-        try await probe.rollback()
-        let identityCandidates = allEntries.filter { entry in
-            entry.key.sourceKind == .summarySales
-                && entry.key.vendorNumber == vendorNumber
-                && entry.key.salesReportKind == reportKind
-                && entry.key.reportDate == reportDate
-        }
-
-        if let requestedVersion = version {
-            // Explicit version: exact identity, with **order-independent**
-            // semantics — importing v1 after v2 never demotes v2, and an
-            // older version never supersedes a newer one, even when the
-            // contents are identical.
-            let key = ASCIngestionKey(
-                sourceKind: .summarySales,
-                vendorNumber: vendorNumber,
-                salesReportKind: reportKind,
-                reportDate: reportDate,
-                reportVersion: requestedVersion
-            )
-            let existing = identityCandidates.first { $0.key.reportVersion == requestedVersion }
-
-            if let existing, existing.state == .imported,
-               existing.contentChecksum == parseResult.contentChecksum {
-                return ASCSalesSyncOutcome(
-                    reportDate: reportDate,
-                    version: version,
-                    outcome: .skippedAlreadyImported,
-                    supersededVersions: []
-                )
+        // Authoritative decision, atomically: the entire post-download
+        // decision table runs inside ONE store transaction, re-reading the
+        // ledger there. Concurrent engines sharing one store serialize at
+        // the transaction slot, so two syncs of the same report can never
+        // both decide that nothing was imported and both commit, and an
+        // older version can never reverse-supersede a newer one. No Apple
+        // network call happens inside the transaction.
+        return try await withDecisionTransaction(store: store) { transaction in
+                // All candidate entries for the full identity minus version:
+                // (source kind, vendor, type/subtype/frequency, report date).
+                // Read **inside** the transaction so the decision is based on
+                // the latest committed state, not on a pre-download probe.
+                let allEntries = try await transaction.ingestionEntries(state: nil)
+                let identityCandidates = allEntries.filter { entry in
+                entry.key.sourceKind == .summarySales
+                    && entry.key.vendorNumber == vendorNumber
+                    && entry.key.salesReportKind == reportKind
+                    && entry.key.reportDate == reportDate
             }
 
-            // Same identity, different content: retain for review. The
-            // previously imported version stays untouched and counted; the
-            // conflicting delivery is recorded under its own delivery key.
-            if let existing {
-                let reason = "sales report \(reportDate) version \(requestedVersion) was previously imported with different content; correction semantics inside one version are not documented, so this delivery is retained but excluded until reviewed"
-                return try await quarantineSalesDelivery(
-                    reason: reason,
-                    key: key,
+            if let requestedVersion = version {
+                // Explicit version: exact identity, with **order-independent**
+                // semantics — importing v1 after v2 never demotes v2, and an
+                // older version never supersedes a newer one, even when the
+                // contents are identical.
+                let key = ASCIngestionKey(
+                    sourceKind: .summarySales,
                     vendorNumber: vendorNumber,
+                    salesReportKind: reportKind,
                     reportDate: reportDate,
-                    version: version,
-                    parseResult: parseResult,
-                    store: store
+                    reportVersion: requestedVersion
                 )
-            }
+                let existing = identityCandidates.first { $0.key.reportVersion == requestedVersion }
 
-            let importedSiblings = identityCandidates.filter {
-                $0.state == .imported && $0.key.deliveryID == nil
-            }
-
-            // Content already imported under a different version label.
-            // Version order decides, regardless of arrival order:
-            // - a provably newer version already carries this content →
-            //   nothing to do (never demote it, even with identical
-            //   bytes);
-            // - all matches are provably older → the requested version
-            //   identifies the same content and supersedes **every**
-            //   matching older entry;
-            // - any match with unresolvable order → manual review.
-            let contentMatches = importedSiblings.filter {
-                $0.key.reportVersion != requestedVersion
-                    && $0.contentChecksum == parseResult.contentChecksum
-            }
-            if !contentMatches.isEmpty {
-                let newerMatches = contentMatches.filter {
-                    ASCSalesVersionOrder.compare(requestedVersion, $0.key.reportVersion) == .older
-                }
-                let incomparableMatches = contentMatches.filter {
-                    ASCSalesVersionOrder.compare(requestedVersion, $0.key.reportVersion) == .incomparable
-                }
-                if let newest = newerMatches.sorted(by: {
-                    ASCSalesVersionOrder.compare($0.key.reportVersion, $1.key.reportVersion) == .newer
-                }).first {
+                if let existing, existing.state == .imported,
+                   existing.contentChecksum == parseResult.contentChecksum {
                     return ASCSalesSyncOutcome(
                         reportDate: reportDate,
                         version: version,
                         outcome: .skippedAlreadyImported,
-                        supersededVersions: [],
-                        notes: ["content of version \(requestedVersion) is already imported as the newer version \(newest.key.reportVersion ?? "nil"); the older version is not imported as current"]
+                        supersededVersions: []
                     )
                 }
-                if let incomparable = incomparableMatches.first {
-                    let reason = "sales report \(reportDate): version \(requestedVersion) has content identical to version \(incomparable.key.reportVersion ?? "nil") but the two versions cannot be ordered; the existing import stays current and manual review of the version labeling is required"
+
+                // Same identity, different content: retain for review. The
+                // previously imported version stays untouched and counted; the
+                // conflicting delivery is recorded under its own delivery key.
+                if let existing {
+                    let reason = "sales report \(reportDate) version \(requestedVersion) was previously imported with different content; correction semantics inside one version are not documented, so this delivery is retained but excluded until reviewed"
                     return try await quarantineSalesDelivery(
                         reason: reason,
                         key: key,
@@ -854,11 +816,180 @@ public struct ASCReportSyncEngine: Sendable {
                         reportDate: reportDate,
                         version: version,
                         parseResult: parseResult,
-                        store: store
+                        transaction: transaction
                     )
                 }
-                // All matches are provably older: import under the
-                // requested version and supersede every one of them.
+
+                let importedSiblings = identityCandidates.filter {
+                    $0.state == .imported && $0.key.deliveryID == nil
+                }
+
+                // Content already imported under a different version label.
+                // Version order decides, regardless of arrival order:
+                // - a provably newer version already carries this content →
+                //   nothing to do (never demote it, even with identical
+                //   bytes);
+                // - all matches are provably older → the requested version
+                //   identifies the same content and supersedes **every**
+                //   matching older entry;
+                // - any match with unresolvable order → manual review.
+                let contentMatches = importedSiblings.filter {
+                    $0.key.reportVersion != requestedVersion
+                        && $0.contentChecksum == parseResult.contentChecksum
+                }
+                if !contentMatches.isEmpty {
+                    let newerMatches = contentMatches.filter {
+                        ASCSalesVersionOrder.compare(requestedVersion, $0.key.reportVersion) == .older
+                    }
+                    let incomparableMatches = contentMatches.filter {
+                        ASCSalesVersionOrder.compare(requestedVersion, $0.key.reportVersion) == .incomparable
+                    }
+                    if let newest = newerMatches.sorted(by: {
+                        ASCSalesVersionOrder.compare($0.key.reportVersion, $1.key.reportVersion) == .newer
+                    }).first {
+                        return ASCSalesSyncOutcome(
+                            reportDate: reportDate,
+                            version: version,
+                            outcome: .skippedAlreadyImported,
+                            supersededVersions: [],
+                            notes: ["content of version \(requestedVersion) is already imported as the newer version \(newest.key.reportVersion ?? "nil"); the older version is not imported as current"]
+                        )
+                    }
+                    if let incomparable = incomparableMatches.first {
+                        let reason = "sales report \(reportDate): version \(requestedVersion) has content identical to version \(incomparable.key.reportVersion ?? "nil") but the two versions cannot be ordered; the existing import stays current and manual review of the version labeling is required"
+                        return try await quarantineSalesDelivery(
+                            reason: reason,
+                            key: key,
+                            vendorNumber: vendorNumber,
+                            reportDate: reportDate,
+                            version: version,
+                            parseResult: parseResult,
+                            transaction: transaction
+                        )
+                    }
+                    // All matches are provably older: import under the
+                    // requested version and supersede every one of them.
+                    let provenance = Self.salesProvenance(
+                        parseResult: parseResult,
+                        vendorNumber: vendorNumber,
+                        reportDate: reportDate,
+                        reportVersion: version,
+                        reportKind: reportKind
+                    )
+                    let provenanced = parseResult.records.map {
+                        ASCProvenancedRecord(record: $0, provenance: provenance)
+                    }
+                    let entry = ASCIngestionEntry(
+                        key: key,
+                        state: .imported,
+                        reportName: "Summary Sales Report",
+                        segmentChecksums: [:],
+                        schemaFingerprint: parseResult.schemaFingerprint,
+                        contentChecksum: parseResult.contentChecksum,
+                        recordCount: parseResult.records.count,
+                        importedAt: Date()
+                    )
+                    try await transaction.insertSales(provenanced, ingestionKey: key)
+                    try await transaction.upsertIngestion(entry)
+                    try await transaction.markSuperseded(
+                        keys: contentMatches.map(\.key), by: key
+                    )
+                    return ASCSalesSyncOutcome(
+                        reportDate: reportDate,
+                        version: version,
+                        outcome: .imported(recordCount: parseResult.records.count),
+                        supersededVersions: contentMatches.compactMap(\.key.reportVersion),
+                        notes: ["content was already imported under older version(s); all of them are superseded by version \(requestedVersion)"]
+                    )
+                }
+
+                let currentSiblings = importedSiblings
+
+                // An unversioned (latest) import with DIFFERENT content: the
+                // relation between the explicit version and that content is
+                // unknowable (older? newer? unrelated correction?) — manual
+                // resolution instead of guessing which one is current.
+                if let unversioned = currentSiblings.first(where: { $0.key.reportVersion == nil }) {
+                    let reason = "sales report \(reportDate): an unversioned (latest) import with different content exists, so version \(requestedVersion) cannot be ordered against it; manual review is required before either can be treated as current"
+                    return try await quarantineSalesDelivery(
+                        reason: reason,
+                        key: key,
+                        vendorNumber: vendorNumber,
+                        reportDate: reportDate,
+                        version: version,
+                        parseResult: parseResult,
+                        transaction: transaction
+                    )
+                }
+
+                // Explicit versions only. Any current sibling with unresolvable
+                // order blocks the import: two current versions with different
+                // content must never coexist silently.
+                let incomparableSiblings = currentSiblings.filter {
+                    ASCSalesVersionOrder.compare(requestedVersion, $0.key.reportVersion) == .incomparable
+                }
+                if let incomparable = incomparableSiblings.first {
+                    let reason = "sales report \(reportDate): version \(requestedVersion) cannot be ordered against the imported version \(incomparable.key.reportVersion ?? "nil"); both contents differ and manual review is required before either can be treated as current"
+                    return try await quarantineSalesDelivery(
+                        reason: reason,
+                        key: key,
+                        vendorNumber: vendorNumber,
+                        reportDate: reportDate,
+                        version: version,
+                        parseResult: parseResult,
+                        transaction: transaction
+                    )
+                }
+
+                // Provably newer current siblings: the requested version is
+                // older. It never supersedes them; it is retained for audit
+                // only so the current statistics do not change and nothing is
+                // double-counted.
+                let newerSiblings = currentSiblings.filter {
+                    ASCSalesVersionOrder.compare(requestedVersion, $0.key.reportVersion) == .older
+                }
+                if let newest = newerSiblings.sorted(by: {
+                    ASCSalesVersionOrder.compare($0.key.reportVersion, $1.key.reportVersion) == .newer
+                }).first {
+                    let supersededBy = newest.key.reportVersion ?? "latest(unversioned)"
+                    let provenance = Self.salesProvenance(
+                        parseResult: parseResult,
+                        vendorNumber: vendorNumber,
+                        reportDate: reportDate,
+                        reportVersion: version,
+                        reportKind: reportKind
+                    )
+                    let provenanced = parseResult.records.map {
+                        ASCProvenancedRecord(record: $0, provenance: provenance)
+                    }
+                    let entry = ASCIngestionEntry(
+                        key: key,
+                        state: .superseded,
+                        reportName: "Summary Sales Report",
+                        segmentChecksums: [:],
+                        schemaFingerprint: parseResult.schemaFingerprint,
+                        contentChecksum: parseResult.contentChecksum,
+                        recordCount: parseResult.records.count,
+                        importedAt: Date(),
+                        supersededBy: newest.key
+                    )
+                    try await transaction.insertSales(provenanced, ingestionKey: key)
+                    try await transaction.upsertIngestion(entry)
+                    return ASCSalesSyncOutcome(
+                        reportDate: reportDate,
+                        version: version,
+                        outcome: .importedForAuditOnly(
+                            recordCount: parseResult.records.count,
+                            supersededBy: supersededBy
+                        ),
+                        supersededVersions: [],
+                        notes: ["version \(requestedVersion) is older than the already imported version \(supersededBy); it is retained for audit only and does not contribute to current queries"]
+                    )
+                }
+
+                // All current explicit siblings are provably older: import and
+                // supersede **all** of them.
+                let supersededVersions = currentSiblings.compactMap(\.key.reportVersion)
                 let provenance = Self.salesProvenance(
                     parseResult: parseResult,
                     vendorNumber: vendorNumber,
@@ -879,116 +1010,84 @@ public struct ASCReportSyncEngine: Sendable {
                     recordCount: parseResult.records.count,
                     importedAt: Date()
                 )
-                try await store.withTransaction { transaction in
-                    try await transaction.insertSales(provenanced, ingestionKey: key)
-                    try await transaction.upsertIngestion(entry)
+
+                try await transaction.insertSales(provenanced, ingestionKey: key)
+                try await transaction.upsertIngestion(entry)
+                if !supersededVersions.isEmpty {
                     try await transaction.markSuperseded(
-                        keys: contentMatches.map(\.key), by: key
+                        keys: currentSiblings.map(\.key), by: key
                     )
                 }
+
                 return ASCSalesSyncOutcome(
                     reportDate: reportDate,
                     version: version,
                     outcome: .imported(recordCount: parseResult.records.count),
-                    supersededVersions: contentMatches.compactMap(\.key.reportVersion),
-                    notes: ["content was already imported under older version(s); all of them are superseded by version \(requestedVersion)"]
+                    supersededVersions: supersededVersions,
+                    notes: []
                 )
             }
 
-            let currentSiblings = importedSiblings
-
-            // An unversioned (latest) import with DIFFERENT content: the
-            // relation between the explicit version and that content is
-            // unknowable (older? newer? unrelated correction?) — manual
-            // resolution instead of guessing which one is current.
-            if let unversioned = currentSiblings.first(where: { $0.key.reportVersion == nil }) {
-                let reason = "sales report \(reportDate): an unversioned (latest) import with different content exists, so version \(requestedVersion) cannot be ordered against it; manual review is required before either can be treated as current"
-                return try await quarantineSalesDelivery(
-                    reason: reason,
-                    key: key,
-                    vendorNumber: vendorNumber,
-                    reportDate: reportDate,
-                    version: version,
-                    parseResult: parseResult,
-                    store: store
-                )
+            // Unversioned "latest available" download. Apple does not echo the
+            // version of this content, so it is recognized by actual content
+            // against the already-imported versions of the report date.
+            let importedCandidates = identityCandidates.filter {
+                $0.state == .imported && $0.key.deliveryID == nil
             }
 
-            // Explicit versions only. Any current sibling with unresolvable
-            // order blocks the import: two current versions with different
-            // content must never coexist silently.
-            let incomparableSiblings = currentSiblings.filter {
-                ASCSalesVersionOrder.compare(requestedVersion, $0.key.reportVersion) == .incomparable
-            }
-            if let incomparable = incomparableSiblings.first {
-                let reason = "sales report \(reportDate): version \(requestedVersion) cannot be ordered against the imported version \(incomparable.key.reportVersion ?? "nil"); both contents differ and manual review is required before either can be treated as current"
-                return try await quarantineSalesDelivery(
-                    reason: reason,
-                    key: key,
-                    vendorNumber: vendorNumber,
-                    reportDate: reportDate,
-                    version: version,
-                    parseResult: parseResult,
-                    store: store
-                )
-            }
-
-            // Provably newer current siblings: the requested version is
-            // older. It never supersedes them; it is retained for audit
-            // only so the current statistics do not change and nothing is
-            // double-counted.
-            let newerSiblings = currentSiblings.filter {
-                ASCSalesVersionOrder.compare(requestedVersion, $0.key.reportVersion) == .older
-            }
-            if let newest = newerSiblings.sorted(by: {
-                ASCSalesVersionOrder.compare($0.key.reportVersion, $1.key.reportVersion) == .newer
-            }).first {
-                let supersededBy = newest.key.reportVersion ?? "latest(unversioned)"
-                let provenance = Self.salesProvenance(
-                    parseResult: parseResult,
-                    vendorNumber: vendorNumber,
-                    reportDate: reportDate,
-                    reportVersion: version,
-                    reportKind: reportKind
-                )
-                let provenanced = parseResult.records.map {
-                    ASCProvenancedRecord(record: $0, provenance: provenance)
-                }
-                let entry = ASCIngestionEntry(
-                    key: key,
-                    state: .superseded,
-                    reportName: "Summary Sales Report",
-                    segmentChecksums: [:],
-                    schemaFingerprint: parseResult.schemaFingerprint,
-                    contentChecksum: parseResult.contentChecksum,
-                    recordCount: parseResult.records.count,
-                    importedAt: Date(),
-                    supersededBy: newest.key
-                )
-                try await store.withTransaction { transaction in
-                    try await transaction.insertSales(provenanced, ingestionKey: key)
-                    try await transaction.upsertIngestion(entry)
-                }
+            if let matching = importedCandidates.first(where: {
+                $0.contentChecksum == parseResult.contentChecksum
+            }) {
+                // The latest content is byte-identical to an already imported
+                // version: nothing new.
                 return ASCSalesSyncOutcome(
                     reportDate: reportDate,
                     version: version,
-                    outcome: .importedForAuditOnly(
-                        recordCount: parseResult.records.count,
-                        supersededBy: supersededBy
-                    ),
+                    outcome: .skippedAlreadyImported,
                     supersededVersions: [],
-                    notes: ["version \(requestedVersion) is older than the already imported version \(supersededBy); it is retained for audit only and does not contribute to current queries"]
+                    notes: ["latest content matches the already imported version \(matching.key.reportVersion ?? "nil")"]
                 )
             }
 
-            // All current explicit siblings are provably older: import and
-            // supersede **all** of them.
-            let supersededVersions = currentSiblings.compactMap(\.key.reportVersion)
+            if !importedCandidates.isEmpty {
+                // A latest download whose content differs from everything
+                // imported: replacement semantics cannot be proven (is this a
+                // correction? which version does it correspond to?). Never
+                // keep serving old statistics silently and never treat it as
+                // the same version — quarantine for manual resolution.
+                let key = ASCIngestionKey(
+                    sourceKind: .summarySales,
+                    vendorNumber: vendorNumber,
+                    salesReportKind: reportKind,
+                    reportDate: reportDate,
+                    reportVersion: nil
+                )
+                let reason = "unversioned latest download of sales report \(reportDate) differs from all imported versions (\(importedCandidates.map { $0.key.reportVersion ?? "nil" }.joined(separator: ", "))); replacement semantics cannot be proven and manual review is required"
+                return try await quarantineSalesDelivery(
+                    reason: reason,
+                    key: key,
+                    vendorNumber: vendorNumber,
+                    reportDate: reportDate,
+                    version: version,
+                    parseResult: parseResult,
+                    transaction: transaction
+                )
+            }
+
+            // First import of this report date: store as an unversioned
+            // (latest) import with its own identity.
+            let key = ASCIngestionKey(
+                sourceKind: .summarySales,
+                vendorNumber: vendorNumber,
+                salesReportKind: reportKind,
+                reportDate: reportDate,
+                reportVersion: nil
+            )
             let provenance = Self.salesProvenance(
                 parseResult: parseResult,
                 vendorNumber: vendorNumber,
                 reportDate: reportDate,
-                reportVersion: version,
+                reportVersion: nil,
                 reportKind: reportKind
             )
             let provenanced = parseResult.records.map {
@@ -1004,111 +1103,15 @@ public struct ASCReportSyncEngine: Sendable {
                 recordCount: parseResult.records.count,
                 importedAt: Date()
             )
-
-            try await store.withTransaction { transaction in
-                try await transaction.insertSales(provenanced, ingestionKey: key)
-                try await transaction.upsertIngestion(entry)
-                if !supersededVersions.isEmpty {
-                    try await transaction.markSuperseded(
-                        keys: currentSiblings.map(\.key), by: key
-                    )
-                }
-            }
-
+            try await transaction.insertSales(provenanced, ingestionKey: key)
+            try await transaction.upsertIngestion(entry)
             return ASCSalesSyncOutcome(
                 reportDate: reportDate,
                 version: version,
                 outcome: .imported(recordCount: parseResult.records.count),
-                supersededVersions: supersededVersions,
-                notes: []
+                supersededVersions: []
             )
         }
-
-        // Unversioned "latest available" download. Apple does not echo the
-        // version of this content, so it is recognized by actual content
-        // against the already-imported versions of the report date.
-        let importedCandidates = identityCandidates.filter {
-            $0.state == .imported && $0.key.deliveryID == nil
-        }
-
-        if let matching = importedCandidates.first(where: {
-            $0.contentChecksum == parseResult.contentChecksum
-        }) {
-            // The latest content is byte-identical to an already imported
-            // version: nothing new.
-            return ASCSalesSyncOutcome(
-                reportDate: reportDate,
-                version: version,
-                outcome: .skippedAlreadyImported,
-                supersededVersions: [],
-                notes: ["latest content matches the already imported version \(matching.key.reportVersion ?? "nil")"]
-            )
-        }
-
-        if !importedCandidates.isEmpty {
-            // A latest download whose content differs from everything
-            // imported: replacement semantics cannot be proven (is this a
-            // correction? which version does it correspond to?). Never
-            // keep serving old statistics silently and never treat it as
-            // the same version — quarantine for manual resolution.
-            let key = ASCIngestionKey(
-                sourceKind: .summarySales,
-                vendorNumber: vendorNumber,
-                salesReportKind: reportKind,
-                reportDate: reportDate,
-                reportVersion: nil
-            )
-            let reason = "unversioned latest download of sales report \(reportDate) differs from all imported versions (\(importedCandidates.map { $0.key.reportVersion ?? "nil" }.joined(separator: ", "))); replacement semantics cannot be proven and manual review is required"
-            return try await quarantineSalesDelivery(
-                reason: reason,
-                key: key,
-                vendorNumber: vendorNumber,
-                reportDate: reportDate,
-                version: version,
-                parseResult: parseResult,
-                store: store
-            )
-        }
-
-        // First import of this report date: store as an unversioned
-        // (latest) import with its own identity.
-        let key = ASCIngestionKey(
-            sourceKind: .summarySales,
-            vendorNumber: vendorNumber,
-            salesReportKind: reportKind,
-            reportDate: reportDate,
-            reportVersion: nil
-        )
-        let provenance = Self.salesProvenance(
-            parseResult: parseResult,
-            vendorNumber: vendorNumber,
-            reportDate: reportDate,
-            reportVersion: nil,
-            reportKind: reportKind
-        )
-        let provenanced = parseResult.records.map {
-            ASCProvenancedRecord(record: $0, provenance: provenance)
-        }
-        let entry = ASCIngestionEntry(
-            key: key,
-            state: .imported,
-            reportName: "Summary Sales Report",
-            segmentChecksums: [:],
-            schemaFingerprint: parseResult.schemaFingerprint,
-            contentChecksum: parseResult.contentChecksum,
-            recordCount: parseResult.records.count,
-            importedAt: Date()
-        )
-        try await store.withTransaction { transaction in
-            try await transaction.insertSales(provenanced, ingestionKey: key)
-            try await transaction.upsertIngestion(entry)
-        }
-        return ASCSalesSyncOutcome(
-            reportDate: reportDate,
-            version: version,
-            outcome: .imported(recordCount: parseResult.records.count),
-            supersededVersions: []
-        )
     }
 
     /// Sales provenance with the full report identity: kind, order-
@@ -1137,7 +1140,9 @@ public struct ASCReportSyncEngine: Sendable {
     }
 
     /// Records a conflicting sales delivery as pending review under its
-    /// own delivery key, keeping the counted imports untouched.
+    /// own delivery key, keeping the counted imports untouched. Writes go
+    /// through the **caller's transaction** — part of the same atomic
+    /// decision, never a separate commit.
     private func quarantineSalesDelivery(
         reason: String,
         key: ASCIngestionKey,
@@ -1145,7 +1150,7 @@ public struct ASCReportSyncEngine: Sendable {
         reportDate: String,
         version: String?,
         parseResult: ASCSalesParseResult,
-        store: any ASCAnalyticsStore
+        transaction: any ASCAnalyticsStoreTransaction
     ) async throws -> ASCSalesSyncOutcome {
         let pendingKey = key.withDeliveryID(parseResult.contentChecksum)
         let provenance = ASCReportProvenance(
@@ -1175,10 +1180,8 @@ public struct ASCReportSyncEngine: Sendable {
             importedAt: Date(),
             pendingReason: reason
         )
-        try await store.withTransaction { transaction in
-            try await transaction.insertSales(provenanced, ingestionKey: pendingKey)
-            try await transaction.upsertIngestion(entry)
-        }
+        try await transaction.insertSales(provenanced, ingestionKey: pendingKey)
+        try await transaction.upsertIngestion(entry)
         return ASCSalesSyncOutcome(
             reportDate: reportDate,
             version: version,
