@@ -64,6 +64,19 @@ reporting data — the reporting companion to
   ASCAPIKit + offline stub), all-or-nothing per instance, content-change
   quarantine as pending review, and Sales version supersession. No
   scheduler — the host app decides when to run it.
+- **Transaction scheduling without retries**: `ASCInMemoryAnalyticsStore`
+  queues `beginTransaction` callers **FIFO with asynchronous waiting** —
+  no fixed retry caps, no `Task.yield` loops. Waiters are
+  cancellation-safe; abandoned (dropped) transactions cannot stall the
+  store. `storeInconsistentState` now only ever describes a real
+  store-protocol misuse.
+- **Offline report verification** (`ASCAnalyticsVerify` CLI): verifies
+  local Apple report files against the official parsers — gzip/TSV/CSV,
+  header identification, unknown-value surfacing, line-number
+  diagnostics, optional single-currency reconciliation against a local
+  expected-JSON file. **Fully offline, zero telemetry, never prints raw
+  report rows.** See `docs/REAL_REPORT_VALIDATION.md` and
+  `docs/VALIDATION_MATRIX.md`.
 
 ### Not implemented / not precisely reproducible
 
@@ -90,6 +103,11 @@ reporting data — the reporting companion to
   published report files; where a report basis differs from a dashboard
   metric, that is documented in `docs/METRIC_DEFINITIONS.md` rather than
   hidden.
+- **Real-report verification**: no real Apple report was available during
+  development (`REAL_APPLE_REPORT_VALIDATION = NOT_RUN_NO_PRIVATE_REPORT`);
+  every report is honestly certified at LEVEL 2 (official format verified)
+  in `docs/VALIDATION_MATRIX.md`. Run the verification CLI locally with a
+  private report to reach LEVEL 3/4.
 - Weekly/monthly Analytics instances and the remaining Analytics report
   families (usage, performance, commerce) parse only through the generic
   machinery; their dedicated models and metrics are future work.

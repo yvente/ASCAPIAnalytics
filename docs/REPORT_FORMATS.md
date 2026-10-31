@@ -121,6 +121,16 @@ them. Unsupported reports are never silently parsed into a guessed
 schema: a header that matches no supported report signature is a hard
 error.
 
+## Verifying a real report locally
+
+`ASCAnalyticsVerify` (see [REAL_REPORT_VALIDATION.md](REAL_REPORT_VALIDATION.md))
+parses a local report file with the exact parsers described here and
+reports format validity, schema identity, unknown values, and optional
+single-currency reconciliation — fully offline, no raw rows printed.
+Current per-report verification levels live in
+[VALIDATION_MATRIX.md](VALIDATION_MATRIX.md) (LEVEL 2 everywhere;
+`REAL_APPLE_REPORT_VALIDATION = NOT_RUN_NO_PRIVATE_REPORT`).
+
 ## Parsing ground rules (enforced in code)
 
 1. Column lookup is by header name (case-insensitive); positions never

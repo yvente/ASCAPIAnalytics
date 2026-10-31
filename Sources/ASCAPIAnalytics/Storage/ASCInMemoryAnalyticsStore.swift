@@ -5,19 +5,40 @@ import Foundation
 /// This is the reference implementation for offline use, tests, and
 /// previews. It enforces the full transaction contract: mutations are
 /// staged inside the transaction, become visible to readers only on
-/// `commit`, and are completely discarded on `rollback`. One unfinished
-/// transaction is active at a time; a second `beginTransaction` fails with
-/// `ASCAnalyticsError.storeInconsistentState` while the first transaction
-/// object is still alive and unfinished. A transaction that is committed,
-/// rolled back, **or simply dropped by the caller** (for example when a
-/// task is cancelled between begin and commit) releases its slot, so a
-/// dropped transaction can never permanently block later syncs.
+/// `commit`, and are completely discarded on `rollback`.
+///
+/// ## Transaction scheduling
+///
+/// At most **one** unfinished transaction is active per store. Additional
+/// `beginTransaction` calls **wait asynchronously in FIFO order** for the
+/// slot instead of failing — no retry loops are needed by callers. The
+/// scheduling guarantees are:
+///
+/// - **FIFO, no starvation**: the slot is handed to the longest-waiting
+///   non-cancelled waiter.
+/// - **Cancellation-safe**: a waiter whose task is cancelled while queued
+///   is removed from the grant order and ends with `CancellationError`;
+///   the slot is never lost and never double-granted. Cancellation and
+///   grant are serialized through the waiter's own lock.
+/// - **Abandoned transactions cannot stall the store forever**: the active
+///   transaction is held weakly; when the owner drops an unfinished
+///   transaction, the next queued (or newly arriving) begin reclaims the
+///   slot. A transaction deliberately parked forever by a live task still
+///   blocks the slot — that is ordinary mutex semantics — but a *dropped*
+///   one never does.
+/// - **Error propagation**: `commit`/`rollback` misuse and use-after-finish
+///   raise `ASCAnalyticsError.storeInconsistentState`, which now only ever
+///   describes a real programming error — never transient contention.
 public final class ASCInMemoryAnalyticsStore: ASCAnalyticsStore, @unchecked Sendable {
     private let lock = NSLock()
     /// Weak reference to the live transaction. When the caller drops an
     /// unfinished transaction, the object deallocates, this becomes `nil`,
-    /// and the slot is free again — no stale flag can remain behind.
+    /// and the next queued (or new) begin reclaims the slot.
     private weak var activeTransaction: Transaction?
+    /// Whether the single write slot is currently taken.
+    private var slotOccupied = false
+    /// FIFO queue of tasks waiting for the slot.
+    private var waiters: [SlotRequest] = []
 
     // Committed state.
     private var ingestions: [ASCIngestionKey: ASCIngestionEntry] = [:]
@@ -27,30 +48,225 @@ public final class ASCInMemoryAnalyticsStore: ASCAnalyticsStore, @unchecked Send
 
     public init() {}
 
-    public func beginTransaction() async throws -> any ASCAnalyticsStoreTransaction {
-        try beginTransactionLocked()
+    // MARK: - Slot acquisition (FIFO, cancellation-safe)
+
+    /// Suspends until the single write slot is granted to `bound`, or
+    /// returns `false` when the waiting task is cancelled first. The
+    /// transaction is bound to the slot **atomically under the store
+    /// lock**, so no window exists in which a second begin could mistake
+    /// the slot for abandoned and double-grant it.
+    private func acquireSlot(bound: Transaction) async -> Bool {
+        // Fast cancellation check before enqueueing.
+        if Task.isCancelled { return false }
+
+        let request = SlotRequest(bound: bound)
+        let grantedImmediately: Bool = await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+                // Synchronous registration under the store lock. Resumes
+                // happen strictly outside this lock.
+                let acquiredNow: Bool = lock.withLock {
+                    if slotIsEffectivelyFree() {
+                        slotOccupied = true
+                        activeTransaction = bound
+                        if let hook = onBeginScheduled { hook(0) }
+                        return true
+                    }
+                    waiters.append(request)
+                    if let hook = onBeginScheduled { hook(waiters.count) }
+                    return false
+                }
+                let resumeNow = request.register(
+                    continuation, acquiredImmediately: acquiredNow
+                )
+                if resumeNow {
+                    continuation.resume(returning: !request.wasCancelled)
+                }
+            }
+        } onCancel: {
+            // Marks the request cancelled and resumes it (outside any
+            // store lock) if it was queued. Does not touch the store's
+            // lock, so no lock-ordering deadlock is possible.
+            request.cancel()
+        }
+        return grantedImmediately || request.wasGranted
     }
 
-    private func beginTransactionLocked() throws -> any ASCAnalyticsStoreTransaction {
-        lock.lock()
-        defer { lock.unlock() }
-        if let current = activeTransaction, !current.isFinished {
-            throw ASCAnalyticsError.storeInconsistentState(
-                reason: "another transaction is already active on this store"
-            )
+    /// Whether the write slot can be granted right now: either free, or
+    /// held by a transaction object that no longer exists (dropped by its
+    /// owner) or has already finished (commit/rollback released the slot
+    /// but the caller kept the reference).
+    private func slotIsEffectivelyFree() -> Bool {
+        guard slotOccupied else { return true }
+        guard let current = activeTransaction else { return true } // abandoned
+        return current.isFinished
+    }
+
+    /// Releases the slot and hands it to the longest-waiting
+    /// non-cancelled waiter (FIFO, no starvation). Called on commit and
+    /// rollback.
+    fileprivate func releaseSlotAndGrantNext() {
+        let resumeList: [(CheckedContinuation<Bool, Never>, Bool)] = lock.withLock {
+            var resumes: [(CheckedContinuation<Bool, Never>, Bool)] = []
+            slotOccupied = false
+            activeTransaction = nil
+            while !waiters.isEmpty {
+                let next = waiters.removeFirst()
+                if let continuation = next.grantIfWaiting() {
+                    slotOccupied = true
+                    activeTransaction = next.bound
+                    resumes.append((continuation, true))
+                    break
+                }
+                // Cancelled waiter: drop it and keep granting.
+            }
+            return resumes
         }
+        // Resume strictly outside the store lock.
+        for (continuation, value) in resumeList {
+            continuation.resume(returning: value)
+        }
+    }
+
+    /// Number of tasks currently queued for the slot (test visibility).
+    var queuedWaiterCount: Int {
+        lock.withLock { waiters.count }
+    }
+
+    /// Test instrumentation: invoked synchronously when a begin either
+    /// queues (argument = queue depth after enqueue) or acquires the slot
+    /// immediately (argument = 0). Tests use it to observe enqueue order
+    /// without polling. Never set in production.
+    var onBeginScheduled: ((Int) -> Void)?
+
+    // MARK: - ASCAnalyticsStore
+
+    public func beginTransaction() async throws -> any ASCAnalyticsStoreTransaction {
+        // Fast cancellation check before enqueueing.
+        try Task.checkCancellation()
         let transaction = Transaction(store: self)
-        activeTransaction = transaction
+        let granted = await acquireSlot(bound: transaction)
+        guard granted else {
+            // The waiting task was cancelled: never acquired, nothing to
+            // release.
+            throw CancellationError()
+        }
         return transaction
     }
 
-    /// Clears the active-transaction slot when the given transaction
-    /// finishes (commit or rollback).
+    /// Clears the active-transaction reference when the given transaction
+    /// finishes (commit or rollback) and hands the slot to the next
+    /// waiter.
     fileprivate func transactionDidFinish(_ transaction: Transaction) {
-        lock.lock()
-        defer { lock.unlock() }
-        if activeTransaction === transaction {
-            activeTransaction = nil
+        lock.withLock {
+            if activeTransaction === transaction {
+                activeTransaction = nil
+            }
+        }
+        releaseSlotAndGrantNext()
+    }
+
+    // MARK: - Slot request (single-resume invariant)
+
+    /// One task's request for the write slot. The phase state machine
+    /// guarantees the continuation is resumed exactly once, and that
+    /// cancellation racing with a grant cannot lose the slot or double
+    /// resume.
+    private final class SlotRequest: @unchecked Sendable {
+        /// The transaction this request will bind to the slot on grant.
+        /// Strong here: a queued request keeps its transaction alive until
+        /// it becomes the active one.
+        fileprivate let bound: Transaction
+        private let stateLock = NSLock()
+        private enum Phase {
+            case idle
+            case queued(CheckedContinuation<Bool, Never>)
+            case granted
+            case cancelled
+        }
+        private var phase: Phase = .idle
+
+        fileprivate init(bound: Transaction) {
+            self.bound = bound
+        }
+
+        /// Registers the continuation. Returns `true` when the caller must
+        /// resume it immediately (already granted or already cancelled);
+        /// `false` when the request is now queued and the continuation
+        /// will be resumed by `grantIfWaiting`/`cancel`.
+        func register(
+            _ continuation: CheckedContinuation<Bool, Never>,
+            acquiredImmediately: Bool
+        ) -> Bool {
+            stateLock.lock()
+            defer { stateLock.unlock() }
+            if acquiredImmediately {
+                phase = .granted
+                return true
+            }
+            switch phase {
+            case .idle:
+                phase = .queued(continuation)
+                return false
+            case .cancelled:
+                return true // resume with cancelled
+            case .granted, .queued:
+                // Unreachable: register runs exactly once per request.
+                return true
+            }
+        }
+
+        /// Cancellation callback. Marks the request cancelled and, if it
+        /// was queued, hands the continuation back for a resume with
+        /// `false`.
+        func cancel() {
+            stateLock.lock()
+            let continuation: CheckedContinuation<Bool, Never>?
+            switch phase {
+            case .queued(let cont):
+                phase = .cancelled
+                continuation = cont
+            case .idle:
+                phase = .cancelled
+                continuation = nil
+            case .granted:
+                // The transaction was already granted; the owner is
+                // responsible for finishing it. Cancellation arriving here
+                // must not release the slot for anyone else.
+                continuation = nil
+            case .cancelled:
+                continuation = nil
+            }
+            stateLock.unlock()
+            continuation?.resume(returning: false)
+        }
+
+        /// Called by the releaser (holding the store lock). Returns the
+        /// continuation to resume with `true`, or `nil` when the request
+        /// was cancelled and must be skipped.
+        func grantIfWaiting() -> CheckedContinuation<Bool, Never>? {
+            stateLock.lock()
+            defer { stateLock.unlock() }
+            switch phase {
+            case .queued(let cont):
+                phase = .granted
+                return cont
+            case .cancelled, .granted, .idle:
+                return nil
+            }
+        }
+
+        var wasCancelled: Bool {
+            stateLock.withLock {
+                if case .cancelled = phase { return true }
+                return false
+            }
+        }
+
+        var wasGranted: Bool {
+            stateLock.withLock {
+                if case .granted = phase { return true }
+                return false
+            }
         }
     }
 

@@ -202,12 +202,19 @@ transaction:
 - Failures and cancellations roll the transaction back; partial data is
   impossible.
 - **Store contract:** implementations must serialize transaction
-  windows on a store (the reference in-memory store allows one live
-  transaction at a time and rejects a second with
-  `storeInconsistentState`, which the engine retries bounded times). An
-  implementation whose transactions do not serialize read-decide-write
-  windows cannot guarantee single-import under concurrency — such an
-  implementation must not claim this contract.
+  windows on a store. The reference in-memory store queues
+  `beginTransaction` callers in **FIFO order with asynchronous waiting**
+  (continuation-based; no busy waiting, no retry caps): at most one
+  write transaction is active, waiters are cancellation-safe (a
+  cancelled waiter is skipped in grant order and ends with
+  `CancellationError`), and a transaction dropped unfinished by its
+  owner cannot stall the store — the next begin reclaims the slot.
+  `ASCAnalyticsError.storeInconsistentState` is reserved for real
+  store-protocol misuse (double commit, use after finish) and is
+  **never** transient contention. An implementation whose transactions
+  do not serialize read-decide-write windows cannot guarantee
+  single-import under concurrency — such an implementation must not
+  claim this contract.
 
 ## What the engine does not do
 

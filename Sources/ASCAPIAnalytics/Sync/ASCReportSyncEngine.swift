@@ -261,27 +261,18 @@ public struct ASCReportSyncEngine: Sendable {
     /// performs all writes there, so two engines sharing one store can
     /// never both decide "not imported" and both commit: the store
     /// serializes the decision windows, and the loser's re-read observes
-    /// the winner's commit. When another engine holds the store's
-    /// transaction slot, the attempt is retried (bounded) after a
-    /// cooperative yield — no network I/O ever happens inside the
-    /// transaction, so retries are cheap and deterministic under test
-    /// gates.
+    /// the winner's commit. Contention is the store's responsibility —
+    /// `ASCInMemoryAnalyticsStore` queues `beginTransaction` callers FIFO
+    /// with asynchronous waiting, so there is no retry loop here and no
+    /// fixed attempt cap. No Apple network I/O ever happens inside the
+    /// transaction. `ASCAnalyticsError.storeInconsistentState` now only
+    /// ever describes a real store-protocol misuse and is propagated
+    /// as-is.
     private func withDecisionTransaction<T: Sendable>(
         store: any ASCAnalyticsStore,
         _ body: (any ASCAnalyticsStoreTransaction) async throws -> T
     ) async throws -> T {
-        var attempts = 0
-        while true {
-            do {
-                return try await store.withTransaction(body)
-            } catch let error as ASCAnalyticsError {
-                guard case .storeInconsistentState = error, attempts < 64 else {
-                    throw error
-                }
-                attempts += 1
-                await Task.yield()
-            }
-        }
+        try await store.withTransaction(body)
     }
 
     // MARK: - Analytics sync
@@ -807,7 +798,7 @@ public struct ASCReportSyncEngine: Sendable {
                 // Same identity, different content: retain for review. The
                 // previously imported version stays untouched and counted; the
                 // conflicting delivery is recorded under its own delivery key.
-                if let existing {
+                if existing != nil {
                     let reason = "sales report \(reportDate) version \(requestedVersion) was previously imported with different content; correction semantics inside one version are not documented, so this delivery is retained but excluded until reviewed"
                     return try await quarantineSalesDelivery(
                         reason: reason,
@@ -909,7 +900,7 @@ public struct ASCReportSyncEngine: Sendable {
                 // relation between the explicit version and that content is
                 // unknowable (older? newer? unrelated correction?) — manual
                 // resolution instead of guessing which one is current.
-                if let unversioned = currentSiblings.first(where: { $0.key.reportVersion == nil }) {
+                if currentSiblings.contains(where: { $0.key.reportVersion == nil }) {
                     let reason = "sales report \(reportDate): an unversioned (latest) import with different content exists, so version \(requestedVersion) cannot be ordered against it; manual review is required before either can be treated as current"
                     return try await quarantineSalesDelivery(
                         reason: reason,

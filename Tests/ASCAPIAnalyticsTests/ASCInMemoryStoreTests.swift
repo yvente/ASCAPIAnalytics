@@ -131,19 +131,76 @@ final class ASCInMemoryStoreTests: XCTestCase {
         XCTAssertEqual(after[0].record.units, 7)
     }
 
-    func testConcurrentTransactionIsRejected() async throws {
-        // Hold the transaction: the slot is occupied only while the
-        // transaction object is alive and unfinished.
+    func testConcurrentTransactionQueuesInsteadOfFailing() async throws {
+        // The second beginTransaction waits FIFO for the slot instead of
+        // failing with a contention error; it proceeds as soon as the
+        // first transaction finishes, whichever way it finishes.
         let active = try await store.beginTransaction()
+
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask {
+                let queued = try await self.store.beginTransaction()
+                try await queued.rollback()
+            }
+            // Roll the first transaction back: the queued begin resumes
+            // and completes either way (queued-before or begun-after).
+            try await active.rollback()
+            try await group.waitForAll()
+        }
+
+        // The store stays fully usable afterwards.
+        try await store.withTransaction { _ in }
+    }
+
+    func testWaiterCancellationReleasesQueueSlot() async throws {
+        // A cancelled waiter is skipped in the grant order; the next
+        // waiter proceeds and the slot is never lost.
+        let active = try await store.beginTransaction()
+
+        let waiterCancelled = expectation(description: "waiter cancelled")
+        let waiterStarted = expectation(description: "waiter started")
+        let secondDone = expectation(description: "second waiter finished")
+
+        let waiterTask = Task {
+            await waiterStarted.fulfill()
+            do {
+                let tx = try await store.beginTransaction()
+                // Unexpected grant: finish cleanly.
+                try await tx.rollback()
+                await waiterCancelled.fulfill()
+            } catch is CancellationError {
+                await waiterCancelled.fulfill()
+            } catch {
+                XCTFail("unexpected error \(error)")
+            }
+            await secondDone.fulfill()
+        }
+        await fulfillment(of: [waiterStarted], timeout: 10)
+        waiterTask.cancel()
+
+        // Rollback releases the slot; the cancelled waiter is skipped, so
+        // this third transaction is granted directly.
+        try await active.rollback()
+        let third = try await store.beginTransaction()
+        try await third.commit()
+        await fulfillment(of: [waiterCancelled, secondDone], timeout: 10)
+    }
+
+    func testConsistencyErrorPropagatesFromTransaction() async throws {
+        // Misusing a transaction (commit twice) surfaces the real
+        // consistency error — it is never swallowed as contention.
+        let tx = try await store.beginTransaction()
+        try await tx.commit()
         do {
-            _ = try await store.beginTransaction()
-            XCTFail("expected concurrent transaction rejection")
+            try await tx.commit()
+            XCTFail("expected storeInconsistentState")
         } catch let error as ASCAnalyticsError {
             guard case .storeInconsistentState = error else {
                 return XCTFail("expected storeInconsistentState, got \(error)")
             }
         }
-        try await active.rollback()
+        // The store remains usable.
+        try await store.withTransaction { _ in }
     }
 
     func testDroppedTransactionReleasesSlotForLaterSyncs() async throws {

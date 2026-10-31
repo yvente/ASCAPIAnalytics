@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (final reliability hardening)
+
+- **Transaction contention redesigned**: the sync engine's bounded
+  retry/`Task.yield` loop is **gone**. `ASCInMemoryAnalyticsStore` now
+  queues `beginTransaction` callers in **FIFO order with asynchronous
+  waiting** (continuation-based, no busy waiting): at most one write
+  transaction per store, waiters are cancellation-safe (cancelled waiters
+  are skipped in grant order and end with `CancellationError`), and a
+  transaction dropped unfinished by its owner cannot stall the store —
+  the next begin reclaims the slot via the weak active-transaction
+  reference. The transaction is bound to the slot atomically at grant
+  time, eliminating a double-grant race. `storeInconsistentState` now
+  only describes real store-protocol misuse; contention never surfaces
+  as an error.
+- **Report verification tooling**: new `ASCAnalyticsVerify` CLI target
+  (offline, no network, no telemetry — it does not link ASCAPIKit) plus
+  the in-library `ASCReportVerification` engine. Verifies local Apple
+  report files (gzip/TSV/CSV, all three supported reports) against the
+  official parsers with non-sensitive diagnostics only; supports an
+  optional local expected-JSON reconciliation with single-currency
+  gross-sales comparison and explicit `NOT COMPARED` scoping.
+- New documentation: `docs/REAL_REPORT_VALIDATION.md` (privacy rules,
+  CLI usage, reconciliation semantics) and `docs/VALIDATION_MATRIX.md`
+  (per-report verification levels, currently LEVEL 2 everywhere;
+  `REAL_APPLE_REPORT_VALIDATION = NOT_RUN_NO_PRIVATE_REPORT`).
+- `.gitignore` blocks private fixture directories and expected-JSON files
+  (defense in depth; the recommended fixture location is outside the
+  repository).
+- 18 new tests (transaction queue fairness/starvation/cancellation/
+  propagation, verification CLI paths) — 228 total, all offline.
+
 ### Fixed (architecture review round 2)
 
 - **Sales version order independence**: importing v1 after v2 never

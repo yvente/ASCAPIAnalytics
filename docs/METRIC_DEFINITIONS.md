@@ -1,7 +1,11 @@
 # Metric Definitions
 
 Reference for the metrics ASCAPIAnalytics computes, their data sources,
-additivity semantics, and support status. Definitions cite Apple's
+additivity semantics, and support status. The per-report verification
+levels (synthetic / official-format / real-report / reconciled) live in
+[VALIDATION_MATRIX.md](VALIDATION_MATRIX.md); with no real Apple report
+available during development, every report is certified at LEVEL 2
+(official format verified) and nothing is claimed as dashboard-aligned. Definitions cite Apple's
 published documentation (App Store Connect metric definitions,
 developer.apple.com/help/app-store-connect-analytics/reference/metrics-definitions,
 and the per-report pages under

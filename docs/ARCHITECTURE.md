@@ -14,7 +14,8 @@ implemented core.
 | `Reports` | `ASCSalesReportParser`, `ASCDownloadsReportParser`, `ASCDiscoveryReportParser` (record models + classification + provenance), `ASCReportProvider` protocol, `ASCAPIClientReportProvider` (ASCAPIKit adapter), `ASCStubReportProvider` (offline) | Only via ASCAPIKit | No |
 | `Metrics` | `ASCSalesMetrics`, `ASCDownloadMetrics`, `ASCDiscoveryMetrics`, `ASCConversionRateEvaluator`, `ASCMetricCatalog` | No | No |
 | `Aggregation` | `ASCSalesAggregator`, `ASCAnalyticsAggregator` (+ filters, summaries), `ASCInstanceSelection` (latest-processing-date overwrite rule) | No | No |
-| `Storage` | `ASCAnalyticsStore` / `ASCAnalyticsStoreTransaction` protocols, ingestion ledger model, `ASCInMemoryAnalyticsStore` reference implementation | No | Protocol only |
+| `Storage` | `ASCAnalyticsStore` / `ASCAnalyticsStoreTransaction` protocols, ingestion ledger model, `ASCInMemoryAnalyticsStore` reference implementation (FIFO async transaction queue — waiters wait, never fail on contention) | No | Protocol only |
+| `Verification` | `ASCReportVerification` — offline local report file verification for the `ASCAnalyticsVerify` CLI (no network, no telemetry) | No | No |
 | `Sync` | `ASCReportSyncEngine` (idempotent, atomic, quarantine-aware) + configurations/results | Yes, via Reports | Yes, via protocols |
 
 ## Dependency direction
@@ -47,8 +48,13 @@ implemented core.
 
 Rules enforced by review and tests:
 
-- Only `Reports` and `Sync` import ASCAPIKit. Parsing, Metrics, and
-  Aggregation are pure, deterministic, and offline-testable.
+- Only `Reports` and `Sync` import ASCAPIKit. Parsing, Metrics,
+  Aggregation, Verification, and the `ASCAnalyticsVerify` executable are
+  pure, deterministic, and offline-testable — the verification CLI does
+  not link ASCAPIKit at all and structurally cannot reach the network.
+- Store implementations must serialize transaction windows: the
+  in-memory reference store queues `beginTransaction` FIFO with
+  asynchronous waiting and cancellation-safe grant order.
 - No layer imports SwiftUI, UIKit, or AppKit.
 - Storage is consumed through protocols declared in this package; the only
   bundled implementation is an in-memory reference store — no database
