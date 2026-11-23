@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- App Store Purchases parsing and daily aggregation for positive in-app
+  purchase events and USD proceeds, including refund adjustments. Paying
+  users remain scoped to the source row.
+
+
 ### Fixed (real-report compatibility)
 
 - **Blank Currency of Proceeds on zero-value rows**: a real Apple Daily

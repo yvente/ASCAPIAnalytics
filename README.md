@@ -37,6 +37,12 @@ reporting data — the reporting companion to
   (`ASCDiscoveryReportParser`): impressions, page views, taps with raw
   source/page/engagement dimensions; Counts and Unique Counts stored
   separately.
+- **App Store Purchases report** (`ASCPurchasesReportParser`,
+  `ASCPurchasesAggregator`): parses purchase type, signed counts, USD
+  proceeds, and row-level paying users. The daily summary counts positive
+  in-app purchase events and includes refund adjustments in proceeds.
+  Paying users remain row-level. Hosts can use the parser directly while
+  the sync engine continues to ingest Downloads and Discovery.
 - **Metrics** with explicit semantics: units by product type, gross sales
   per Customer Currency, developer proceeds per Currency of Proceeds —
   never summed across currencies.
