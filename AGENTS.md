@@ -67,6 +67,18 @@ docs/                      Planning docs and decision records.
 
 ## Working rules for agents
 
+- Never reintroduce retry loops, busy waiting (`Task.yield` polling), or
+  fixed attempt caps around store transactions: `ASCInMemoryAnalyticsStore`
+  schedules `beginTransaction` FIFO with asynchronous waiting, and
+  `storeInconsistentState` means a real protocol misuse. Any transaction
+  correctness problem must be fixed in the store's scheduling, not
+  masked by callers.
+- The verification CLI (`ASCAnalyticsVerify`) and
+  `ASCReportVerification` must stay offline-only, telemetry-free, and
+  must never print raw report rows or accept real reports into the
+  repository. Real-report verification levels in
+  `docs/VALIDATION_MATRIX.md` may not be claimed above what was actually
+  performed (levels cannot be skipped).
 - Run `swift build` and `swift test` before finishing any task; both must
   pass. Report failures honestly — never claim success without output.
 - Keep `README.md` and `CHANGELOG.md` in sync with reality. The README must

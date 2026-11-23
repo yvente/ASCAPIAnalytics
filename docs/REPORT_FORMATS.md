@@ -1,69 +1,161 @@
 # Report Formats
 
-Inventory of the Apple report families ASCAPIAnalytics plans to adapt, and
-the ground rules for parsing them. **No parser is implemented yet.**
+Inventory of the Apple report families ASCAPIAnalytics adapts, with the
+field lists verified against the official documentation. Sources:
 
-> ⚠️ **Mandatory before implementing any parser:** verify the exact export
-> names, file layout, column list, and column order against the current
-> official App Store Connect documentation and a real (local, never
-> committed) export. Apple changes report schemas; this document records
-> intent, not a frozen contract.
+- Summary Sales Report: developer.apple.com/help/app-store-connect/reference/summary-sales-report
+- Product type identifiers: developer.apple.com/help/app-store-connect/reference/product-type-identifiers
+- App Downloads report: developer.apple.com/documentation/analytics-reports/app-download
+- App Store Discovery and Engagement: developer.apple.com/documentation/analytics-reports/app-store-discovery-and-engagement
+- Data Completeness and Corrections: developer.apple.com/documentation/analytics-reports/data-completeness-corrections
 
-## 1. App Store Connect Analytics reports
+> Apple changes report schemas. Column **positions** may change over time
+> — Apple explicitly advises relying on column names, which is how the
+> parsers work. When Apple introduces fields this package does not know,
+> they are preserved verbatim in each record's `extraFields`; when it
+> introduces values this package does not classify (product types,
+> download types, events), they are preserved and surfaced rather than
+> folded into a known bucket.
 
-Exported from App Store Connect → Analytics, or via the App Store Connect API
-analytics report endpoints that ASCAPIKit already exposes. Expected to be
-gzipped TSV/CSV with a header row and UTC timestamps.
+## 1. Summary Sales Report (Sales and Trends) — implemented
 
-Planned adaptation targets (export names to be verified):
+Delivered gzip-compressed TSV, UTF-8, via `/v1/salesReports`
+(`SALES` / `SUMMARY` / `DAILY`, with a `version` filter for Apple's
+corrected restatements). Dates are `MM/DD/YYYY`. Money types are
+`DECIMAL(18,2)`; values like `.7` (no leading zero) occur in Apple's own
+examples.
 
-- **App Downloads** — first-time downloads, re-downloads, updates, by day and
-  territory/platform/version.
-- **Product Page Views (App Page Views)** — unique and total page views.
-- **Impressions (App Store Impressions)** — impressions split by source
-  (App Store browse, search, etc.).
-- **In-App Purchases** — IAP transaction counts, if published for the app.
+Required columns parsed (version 1_3):
 
-Notes:
+| Column | Type | Notes |
+|---|---|---|
+| Begin Date | Date `MM/DD/YYYY` | Report window start; the record's event date |
+| End Date | Date `MM/DD/YYYY` | Report window end |
+| Apple Identifier | `DECIMAL(18,0)` | The row's Apple ID (app/product) |
+| SKU | `VARCHAR` | Seller SKU |
+| Parent Identifier | `VARCHAR(100)` | Apple: the SKU of the app associated with an In-App Purchase; blank otherwise |
+| Product Type Identifier | `VARCHAR(20)` | Classified from Apple's table; unknown values preserved |
+| Units | `DECIMAL(18,2)` | Negative = refund or CMB-C credit; 0 may indicate a partial refund |
+| Customer Price | `DECIMAL(18,2)` | Per unit, Customer Currency; negative = refund or CMB-C credit |
+| Customer Currency | `CHAR(3)` | ISO code |
+| Developer Proceeds | `DECIMAL(18,2)` | **Per unit**, Currency of Proceeds; **positive** on refund rows |
+| Currency of Proceeds | `CHAR(3)` | Proceeds currency. A real Apple Daily Summary report contained blank values for zero-price, zero-proceeds rows. The parser represents these as `nil` and excludes them from proceeds currency buckets. When present, the value must be a valid three-letter currency code. A row with non-zero Customer Price or Developer Proceeds must provide a proceeds currency. |
+| Country Code | `CHAR(2)` | ISO storefront code |
+| CMB | `VARCHAR(5)` | `CMB` = completes an app bundle; `CMB-C` = credit for a previously purchased app; blank otherwise |
 
-- Availability windows and lateness rules differ per report and must be
-  verified; sync must tolerate late-arriving and corrected files.
-- Some reports deduplicate per device per day, which makes their totals
-  non-additive across dimensions.
+Sign conventions verified against Apple's examples:
 
-## 2. Sales and Trends reports
+- Sale: positive units, positive prices.
+- Refund: `Units: -50, Developer Proceeds: .7, Customer Price: -0.99` —
+  negative units and customer price, **positive** per-unit proceeds.
+- Bundle: `1-B`/`F1-B` rows with `CMB = "CMB"` plus `CMB-C` credit rows;
+  the CMB customer price plus the sum of the CMB-C customer prices equals
+  the bundle price the customer paid.
+- Developer codes: units counted, both money fields 0.
 
-Exported from App Store Connect → Sales and Trends, or via the API report
-endpoints.
+All other columns (Provider, Provider Country, Developer, Title, Version,
+Promo Code, Subscription, Period, Category, Supported Platforms, Device,
+Preserved Pricing, Proceeds Reason, Client, Order Type, …) are preserved
+verbatim in `extraFields`.
 
-- **Sales report** — transaction-level daily/weekly/monthly TSV, gzip
-  compressed, UTF-8. Commonly observed columns include: `Provider`,
-  `Provider Country`, `SKU`, `Developer`, `Title`, `Version`,
-  `Product Type Identifier`, `Units`, `Developer Proceeds`, `Begin Date`,
-  `End Date`, `Customer Currency`, `Country Code`, `Customer Price`,
-  `Promo Code`, and related fields. **The exact current column list and order
-  must be verified against the official documentation and a real export
-  before parsing.**
-- **Payments / Financial reports** — payout-oriented documents. Out of scope
-  for the initial milestone; listed here so they are not mistaken for sales
-  data.
+Zero-proceeds rows without a Currency of Proceeds are counted in
+`ASCSalesMetrics.zeroProceedsWithoutCurrencyRowCount` and excluded from
+proceeds currency buckets (they still contribute units and product-type
+breakdowns). A real 2026-10-28 Daily Summary report parsed 64/64 rows
+under this rule.
 
-Notes:
+## 2. App Downloads report (Analytics Reports API) — implemented
 
-- The Sales report is published with a delay and is subject to Apple's
-  corrections and restatements; deduplicate by report segment, not by file.
-- Amounts are in the customer currency; proceed/sales conversion is Apple's.
+Instances (daily / weekly / monthly, per processing date) of one or more
+gzip-compressed segments; segments may be tab- or comma-delimited (both
+supported; detected from the header). The Date column is `YYYY-MM-DD`
+(first day of the week/month for weekly/monthly instances). Standard and
+detailed variants share the core columns; detailed-only columns are
+preserved when present.
 
-## 3. Parsing ground rules
+Core columns: **Date**, **App Name**, **App Apple Identifier**,
+**Download Type**, **App Version**, **Device**, **Platform Version**,
+**Source Type**, **Source Info**, **Campaign**, **Page Type**,
+**Page Title**, **Pre-Order**, **Territory**, **Counts**.
 
-1. Verify the official field list for the specific report version before
-   parsing; treat unknown columns as errors or explicitly carry them through,
-   never silently drop.
-2. Decompress gzip in memory or temp storage; raw reports are never written
-   into the repository.
-3. TSV/CSV decoding must handle quoting, BOM, and Apple's header rows.
-4. Timestamps are UTC; preserve the report's own date semantics.
-5. Every parsed batch records provenance: report type, instance identifier,
-   fetch time, schema fingerprint.
-6. Fixtures in tests are hand-crafted synthetic data; real exports are never
-   committed (`.gitignore` blocks them).
+The `Pre-Order` flag marks downloads that **came from a pre-order** —
+those rows are already inside their download-type buckets. It is not a
+count of independent pre-order placements (Apple's Pre-Orders metric,
+"placed, minus cancelations", lives in the App Store Pre-orders report);
+the flag must never be added on top of download totals.
+
+Download Type glossary (case-insensitive match, unknown values preserved):
+
+| Value | Meaning |
+|---|---|
+| First-time Download | First download by the user — **based on the user's Apple ID account**, not the device |
+| Redownload | Subsequent installation by an Apple ID account |
+| Manual update | User tapped Update |
+| Auto-update | Device replaced the app automatically |
+| Restore | Restored from iCloud Backup |
+
+Completeness: within two days. Instances may carry late-arriving batches
+or, rarely, corrections; the latest processing date overwrites earlier
+ones per event date (see `SYNC_SEMANTICS.md`).
+
+## 3. App Store Discovery and Engagement report (Analytics Reports API) — implemented
+
+Same delivery mechanics as the downloads report. Completeness: within
+three days.
+
+Core columns: **Date**, **App Name**, **App Apple Identifier**, **Event**,
+**Page Type**, **Page Title**, **Source Type**, **Source Info**,
+**Campaign**, **Engagement Type**, **Device**, **Platform Version**,
+**Territory**, **Counts**, **Unique Counts**.
+
+Event glossary: `Impression` (icon seen in a list — excludes page views),
+`Page view` (dedicated page presented), `Tap` (on an impression or page);
+unknown events preserved.
+
+Counts and Unique Counts are stored separately. Unique Counts are
+deduplicated by Apple **per date and per dimension combination**; the
+record exposes its deduplication-domain key and the metrics layer refuses
+to sum across domains.
+
+## 4. Other report families — not yet adapted
+
+The remaining Analytics reports (App Usage, Performance, Commerce,
+Framework Usage) and the financial/Payments reports are **not** adapted
+yet. The generic parsing machinery (gzip, TSV/CSV, table) handles their
+containers, but no dedicated models, metrics, or sync defaults exist for
+them. Unsupported reports are never silently parsed into a guessed
+schema: a header that matches no supported report signature is a hard
+error.
+
+## Verifying a real report locally
+
+`ASCAnalyticsVerify` (see [REAL_REPORT_VALIDATION.md](REAL_REPORT_VALIDATION.md))
+parses a local report file with the exact parsers described here and
+reports format validity, schema identity, unknown values, and optional
+single-currency reconciliation — fully offline, no raw rows printed.
+Current per-report verification levels are maintained in
+[VALIDATION_MATRIX.md](VALIDATION_MATRIX.md):
+
+- Summary Sales: LEVEL 3 — REAL_REPORT_PARSED (one private Apple Daily
+  Summary report successfully parsed locally).
+- App Downloads: LEVEL 2 — OFFICIAL_FORMAT_VERIFIED.
+- App Store Discovery and Engagement: LEVEL 2 — OFFICIAL_FORMAT_VERIFIED.
+- LEVEL 4 — METRICS_RECONCILED has not yet been achieved.
+
+## Parsing ground rules (enforced in code)
+
+1. Column lookup is by header name (case-insensitive); positions never
+   matter.
+2. gzip is validated fully (header fields, CRC32, ISIZE); corrupt or
+   truncated input is an error.
+3. Unknown columns are carried through verbatim; known-but-unclassified
+   values keep their raw form and surface in metrics.
+4. Timestamps/dates keep each report's own semantics: Sales dates are
+   `MM/DD/YYYY` transaction windows; Analytics dates are `YYYY-MM-DD`
+   event days. They are never conflated.
+5. Every parsed batch records provenance: report family, instance and
+   segment identity, processing date, schema fingerprint, content
+   checksum.
+6. Fixtures in tests are hand-crafted synthetic data modeled on Apple's
+   published examples; real exports are never committed (`.gitignore`
+   blocks them).

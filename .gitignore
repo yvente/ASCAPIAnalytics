@@ -36,6 +36,12 @@ AuthKey_*
 *.csv
 # Synthetic hand-crafted fixtures under Tests are allowed:
 !Tests/**/Fixtures/**
+# --- Private real-report fixtures (defense in depth; the recommended
+# location is OUTSIDE the repository) ---
+ASCAPIAnalytics-PrivateFixtures/
+*PrivateFixtures/
+expected*.json
+!Tests/**/Fixtures/**/*.json
 
 # --- Temporary and private local data ---
 /tmp/
